@@ -40,10 +40,13 @@ def case_to_test(pp_size: int, tp_size: int) -> ArgsTest:
         target_tensor_parallel_size=tp_size,
         max_num_seqs=8,  # force multiple PP batches
         engine_kwargs={
+            # The repro requires async scheduling: in sync mode the handler
+            # takes the placeholder branch and this test reproduces nothing.
+            "async_scheduling": True,
             "structured_outputs_config": {
                 "backend": "xgrammar",
                 "disable_any_whitespace": True,
-            }
+            },
         },
     )
 
