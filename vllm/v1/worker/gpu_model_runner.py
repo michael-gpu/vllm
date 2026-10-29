@@ -912,6 +912,7 @@ class GPUModelRunner(
         # replayed as one gap catch-up prefill at the resume. req_id ->
         # {"tokens"|"positions"|"hidden": [row tensors], "next": [scalars]}.
         self._eagle_k0_stash: dict[str, dict[str, list[torch.Tensor]]] = {}
+        self._eagle_k0_stash_live_len = 0
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -5085,9 +5086,13 @@ class GPUModelRunner(
         """
         req_ids = self.input_batch.req_ids
         live = self.requests
-        for rid in list(self._eagle_k0_stash):
-            if rid not in live:
-                del self._eagle_k0_stash[rid]
+        # Prune finished requests' entries only when the live set changed —
+        # the scan is O(stash) and the steady hold has no finishes.
+        if len(live) != self._eagle_k0_stash_live_len:
+            for rid in list(self._eagle_k0_stash):
+                if rid not in live:
+                    del self._eagle_k0_stash[rid]
+            self._eagle_k0_stash_live_len = len(live)
         qsl = common_attn_metadata.query_start_loc_cpu
         total = int(qsl[-1])
         if total > 0:
