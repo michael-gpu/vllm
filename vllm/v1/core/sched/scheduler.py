@@ -348,7 +348,7 @@ class Scheduler(SchedulerInterface):
         # K=0 slot release: free the per-draft-token mamba state blocks while
         # the adaptive batch is at the K=0 tier (idle hedges there).
         self._k0_slot_release = (
-            envs.MAMBA_K0_SLOT_RELEASE and self.dynamic_sd_lookup is not None
+            envs.VLLM_MAMBA_K0_SLOT_RELEASE and self.dynamic_sd_lookup is not None
         )
 
         # Create the KV cache manager.
