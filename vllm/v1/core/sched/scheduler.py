@@ -1831,19 +1831,11 @@ class Scheduler(SchedulerInterface):
                     # (admitted at the edge step, drafter skipped) at zero.
                     for req_id in num_scheduled_tokens:
                         self._eagle_sync_points.setdefault(req_id, 0)
-            elif num_spec_tokens_to_schedule == 0 and not any(
-                v > 1 for v in num_scheduled_tokens.values()
-            ):
-                # Entered the K=0 tier on an all-decode step: stamp requests
-                # with no tracked write (newly admitted here, drafter
-                # skipped) at zero and hold. Tracked requests' sync points
-                # are already exact — they are refreshed in
-                # update_from_output after every drafter step. A step that
-                # schedules prefill chunks does not hold: the hold would
-                # only defer the chunks' drafter sync to the replay while
-                # the stash retains every chunk row's hidden state (GBs at
-                # wave scale), so those steps run the ordinary per-step sync
-                # prefill and the hold engages once the batch is all-decode.
+            elif num_spec_tokens_to_schedule == 0:
+                # Entered the K=0 tier: stamp requests with no tracked write
+                # (newly admitted here, drafter skipped) at zero and hold.
+                # Tracked requests' sync points are already exact — they are
+                # refreshed in update_from_output after every drafter step.
                 for req_id in num_scheduled_tokens:
                     self._eagle_sync_points.setdefault(req_id, 0)
                 self._eagle_hold = True
@@ -2898,11 +2890,13 @@ class Scheduler(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
-        # Eagle K=0 lifecycle: the drafter ran this step (speculation, the
-        # catch-up replay, or the K=0 per-step sync prefill on a non-held
-        # step), so each scheduled request's written draft coverage now
-        # extends to its post-rejection frontier.
-        if self.eagle_k0_lifecycle and not scheduler_output.eagle_k0_hold:
+        # Eagle K=0 lifecycle: the drafter ran this step (speculation or the
+        # catch-up replay), so each scheduled request's written draft
+        # coverage now extends to its post-rejection frontier.
+        if self.eagle_k0_lifecycle and (
+            scheduler_output.num_spec_tokens_to_schedule > 0
+            or scheduler_output.eagle_catchup_req_ids
+        ):
             for req_id in scheduler_output.num_scheduled_tokens:
                 if req := self.requests.get(req_id):
                     self._eagle_sync_points[req_id] = req.num_computed_tokens

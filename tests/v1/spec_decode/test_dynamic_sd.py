@@ -350,26 +350,15 @@ def test_eagle_k0_lifecycle_hold_resume_cycle(monkeypatch):
             request.num_computed_tokens
         )
 
-    # Admitting a 5th request moves the batch to the K=0 tier. Its first
-    # step schedules the new request's prefill chunk: no hold — the step
-    # runs the ordinary per-step sync prefill (holding over chunks would
-    # only defer this drafter work to the replay while the stash retains
-    # every chunk row's hidden state), and the written-coverage tracker
-    # refreshes exactly as on any drafter step.
+    # Admitting a 5th request moves the batch to the K=0 tier: the edge
+    # engages the hold; the newly admitted request has no tracked write.
     fifth = create_requests(num_requests=5, num_tokens=20)[-1]
     scheduler.add_request(fifth)
     output = _step(scheduler)
     assert output.num_spec_tokens_to_schedule == 0
-    assert not output.eagle_k0_hold
-    assert not scheduler._eagle_hold
-    assert scheduler._eagle_sync_points[fifth.request_id] == (fifth.num_computed_tokens)
-
-    # The next step is all-decode: the hold engages from an exact sync.
-    output = _step(scheduler)
-    assert output.num_spec_tokens_to_schedule == 0
     assert output.eagle_k0_hold
     assert scheduler._eagle_hold
-    fifth_sync = scheduler._eagle_sync_points[fifth.request_id]
+    assert scheduler._eagle_sync_points[fifth.request_id] == 0
 
     # Held steps: the entry trim releases the edge step's transient draft
     # growth and the allocation cap keeps the tables at the frozen sync
@@ -419,10 +408,10 @@ def test_eagle_k0_lifecycle_hold_resume_cycle(monkeypatch):
     assert block_ids is not None and block_ids[1], (
         "re-grown eagle blocks missing from the resume step's replace table"
     )
-    # The edge admission synced inline before the hold; its catch-up
-    # covers only the held-back decode rows, not its inline-synced
-    # prefill.
-    assert output.eagle_catchup_req_ids[fifth.request_id] == (fifth_nc - fifth_sync)
+    # The mid-hold admission catches up over its full context (every token
+    # computed before the resume step; the pause step's own token is not
+    # part of the gap).
+    assert output.eagle_catchup_req_ids[fifth.request_id] == fifth_nc
 
     # The step after the pause speculates normally again.
     output = _step(scheduler)
@@ -447,16 +436,15 @@ def test_eagle_k0_lifecycle_midhold_admission(monkeypatch):
     output = _step(scheduler)
     assert output.num_spec_tokens_to_schedule == 2
 
-    # The 5th same-prompt request tips the batch into the K=0 tier. Its
-    # prefill-chunk step does not hold (the per-step sync prefill runs and
-    # refreshes its coverage); the hold engages on the next all-decode
-    # step, and the entry trim releases the transient draft growth from
-    # there.
+    # The 5th same-prompt request tips the batch into the K=0 tier.
     fifth = create_requests(num_requests=5, num_tokens=20, same_prompt=True)[-1]
     scheduler.add_request(fifth)
     output = _step(scheduler)
-    assert not output.eagle_k0_hold
-    assert scheduler._eagle_sync_points[fifth.request_id] == (fifth.num_computed_tokens)
+    assert output.eagle_k0_hold
+    assert scheduler._eagle_sync_points[fifth.request_id] == 0
+    # One held step: the entry trim releases the edge step's transient draft
+    # growth (the 5th's adopted hit included) and the tables sit at their
+    # sync points.
     output = _step(scheduler)
     assert output.eagle_k0_hold
 
