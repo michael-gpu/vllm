@@ -1748,12 +1748,13 @@ class MambaManager(SingleTypeKVCacheManager):
 
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
-            spec_blocks = (
-                0
-                if request_id in self._spec_released and self._spec_release_mode
-                else self.num_speculative_blocks
+            # The speculative window positions always count toward the row
+            # (released rows hold them as null blocks); only the physical
+            # reservation is suppressed, by the cap and the admission
+            # window substitution in allocate_new_blocks.
+            num_required_blocks = (
+                cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
-            num_required_blocks = cdiv(num_tokens, self.block_size) + spec_blocks
             num_new_blocks = (
                 num_required_blocks
                 - len(new_computed_blocks)
@@ -1802,6 +1803,32 @@ class MambaManager(SingleTypeKVCacheManager):
                 if not blocks_allocated and request_id not in self._spec_released:
                     physical_block_cap += self.num_speculative_blocks
                 num_new_blocks = min(num_new_blocks, physical_block_cap)
+            if request_id in self._spec_released:
+                # The released window's null positions are refilled with
+                # fresh physical blocks — on the K>0 resume (always), or
+                # at K=0 as the boundary advances into them (only when
+                # the growth branch runs) — on top of the row-length
+                # need the cap above bounds.
+                row = self.req_to_blocks[request_id]
+                if len(row) >= self.num_speculative_blocks:
+                    window = row[len(row) - self.num_speculative_blocks :]
+                    if not self._spec_release_mode:
+                        num_new_blocks += sum(1 for block in window if block.is_null)
+                    elif (
+                        num_required_blocks > len(row)
+                        or has_partial_hit
+                        or checkpoint_block
+                    ):
+                        live_start = max(
+                            num_required_blocks
+                            - self.num_speculative_blocks
+                            - 1
+                            - checkpoint_block,
+                            0,
+                        )
+                        num_new_blocks += sum(
+                            1 for block in row[live_start:] if block.is_null
+                        )
 
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
@@ -1828,18 +1855,22 @@ class MambaManager(SingleTypeKVCacheManager):
             # mamba layers.
             num_tokens = num_tokens_main_model
             req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
-            if request_id in self._spec_released and not self._spec_release_mode:
-                # K>0 resume: swap fresh hedge blocks into the null
-                # positions. The hedge slots are empty allocations, not
-                # computed data, so fresh blocks are correct without any
-                # replay. Returns True when positions changed (the runner
-                # row must be rebuilt); collected by the caller.
+            released = request_id in self._spec_released
+            if released and not self._spec_release_mode:
+                # K>0 resume: refill the window's null positions with
+                # fresh hedge blocks. The hedge slots are empty
+                # allocations, not computed data, so fresh blocks are
+                # correct without any replay. Only nulls are replaced
+                # (see resume_spec_blocks). Marks the row for rebuild
+                # when positions changed; collected by the caller.
                 self.resume_spec_blocks(request_id)
-            spec_blocks = (
-                0
-                if request_id in self._spec_released and self._spec_release_mode
-                else self.num_speculative_blocks
-            )
+                released = request_id in self._spec_released
+            # The speculative window positions always count toward the
+            # row: a released row holds them as null blocks, so the
+            # nulls pad the row exactly like physical hedge blocks
+            # would. Only the physical reservation is suppressed (the
+            # window substitution and the cap below).
+            spec_blocks = self.num_speculative_blocks
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
             num_required_blocks = cdiv(num_tokens, self.block_size) + spec_blocks
@@ -1897,8 +1928,42 @@ class MambaManager(SingleTypeKVCacheManager):
                 max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
                 if not blocks_allocated:
                     max_new_blocks += self.num_speculative_blocks
+                # A request admitted while released holds its speculative
+                # window as null positions: they are row slots, not pool
+                # blocks, so the physical take is smaller by the window.
+                free_window = (
+                    self.num_speculative_blocks
+                    if released and self._spec_release_mode and not blocks_allocated
+                    else 0
+                )
+                # K=0 growth refills the released window's null positions
+                # in place as the boundary advances into them: physical
+                # blocks beyond the row-length need, bounded by the
+                # window. Without the refill the state chain would walk
+                # into null blocks.
+                fill_pool = 0
+                if released and self._spec_release_mode:
+                    live_start = max(num_skipped_blocks - checkpoint_block, 0)
+                    fill_pool = sum(
+                        1 for block in req_blocks[live_start:] if block.is_null
+                    )
                 assert num_new_blocks <= max_new_blocks
-                new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                new_blocks = self.block_pool.get_new_blocks(
+                    num_new_blocks + fill_pool - free_window
+                )
+                if fill_pool:
+                    fill_limit = len(new_blocks) - int(has_partial_hit)
+                    fill_idx: list[int] = []
+                    for idx in range(live_start, len(req_blocks)):
+                        if len(fill_idx) >= fill_limit:
+                            break
+                        if req_blocks[idx].is_null:
+                            fill_idx.append(idx)
+                    for idx, block in zip(fill_idx, new_blocks):
+                        req_blocks[idx] = block
+                    if fill_idx:
+                        self._spec_row_rebuilds.add(request_id)
+                        new_blocks = new_blocks[len(fill_idx) :]
                 returned_blocks = req_blocks[prev_block_len:]
                 if partial_hit is not None:
                     block_idx, source_block = partial_hit
@@ -1939,9 +2004,13 @@ class MambaManager(SingleTypeKVCacheManager):
                         self._apply_cow(request_id, block_idx, source_block, cow_block)
                         returned_blocks = [cow_block] + returned_blocks
                 req_blocks.extend(new_blocks)
+                if free_window:
+                    req_blocks.extend([self._null_block] * free_window)
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
                 returned_blocks.extend(new_blocks)
+                if free_window:
+                    returned_blocks.extend([self._null_block] * free_window)
                 return returned_blocks
 
     def set_spec_release_mode(self, active: bool) -> None:
@@ -1960,7 +2029,11 @@ class MambaManager(SingleTypeKVCacheManager):
         Returns True only when blocks were freed (the runner row must be
         rebuilt); a request with no blocks yet is just marked.
         """
-        if self.num_speculative_blocks <= 0 or request_id in self._spec_released:
+        if (
+            self.num_speculative_blocks <= 0
+            or self.mamba_cache_mode != "align"
+            or request_id in self._spec_released
+        ):
             return False
         self._spec_released.add(request_id)
         req_blocks = self.req_to_blocks.get(request_id)
@@ -1979,18 +2052,31 @@ class MambaManager(SingleTypeKVCacheManager):
 
         The hedge slots are empty allocations, not computed data: the
         committed state lives in the base blocks, so fresh blocks are
-        correct without any replay.
+        correct without any replay. Only null positions are refilled —
+        a request admitted at the K=0 tier has committed blocks (or no
+        row) where the hedge would be, and those must not be touched.
         """
         if request_id not in self._spec_released:
             return False
-        self._spec_released.discard(request_id)
         req_blocks = self.req_to_blocks.get(request_id)
         if not req_blocks or len(req_blocks) < self.num_speculative_blocks:
+            # Nothing to restore yet; stay marked and retry on a later
+            # step (the mark must not clear before blocks are placed,
+            # or the relocation loop would run over the naked row).
             return False
         tail_start = len(req_blocks) - self.num_speculative_blocks
-        req_blocks[tail_start:] = self.block_pool.get_new_blocks(
-            self.num_speculative_blocks
-        )
+        null_slots = [
+            i for i, block in enumerate(req_blocks[tail_start:]) if block.is_null
+        ]
+        if not null_slots:
+            # Window already real (e.g. re-admitted with a physical
+            # hedge): nothing to restore, just clear the mark.
+            self._spec_released.discard(request_id)
+            return False
+        fresh = self.block_pool.get_new_blocks(len(null_slots))
+        for i, block in zip(null_slots, fresh):
+            req_blocks[tail_start + i] = block
+        self._spec_released.discard(request_id)
         self._spec_row_rebuilds.add(request_id)
         return True
 
