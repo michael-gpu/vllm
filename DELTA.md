@@ -1,17 +1,17 @@
 <!-- markdownlint-disable MD060 -->
 # Delta vs upstream vLLM
 
-`main` = upstream `main` (nightly merge) + the commits below: 20 source commits (74 files changed, 4883 insertions(+), 291 deletions(-)).
+`main` = upstream `main` (nightly merge) + the commits below: 23 source commits (73 files changed, 4902 insertions(+), 275 deletions(-)).
 
-Diff base: upstream commit `914d61fc53` — the tip this tree last merged from origin. Reproduce at this commit with:
-`git log --no-merges 914d61fc53..575219c5e1 -- vllm/ csrc/` and `git diff --stat 914d61fc53..575219c5e1 -- vllm/ csrc/`.
+Diff base: upstream commit `4e0ad57203` — the tip this tree last merged from origin. Reproduce at this commit with:
+`git log --no-merges 4e0ad57203..ce1086924b -- vllm/ csrc/` and `git diff --stat 4e0ad57203..ce1086924b -- vllm/ csrc/`.
 
 Areas upstream does not ship for this hardware are what this distribution exists to carry; general fixes are contributed upstream first (see README). Regenerated automatically by the nightly integrate.
 
 | Area | Commits |
 |---|---|
-| spec-decode fixes | 7 |
-| general fixes | 6 |
+| general fixes | 8 |
+| spec-decode fixes | 8 |
 | model bring-up (GLM5Next / Qwen4Exp / DSV41) | 2 |
 | KV-cache / offload fixes | 1 |
 | fork delta (squash: sparse attention (TRITON_MLA_SPARSE) + KV-cache / offload fixes) | 1 |
@@ -21,6 +21,9 @@ Areas upstream does not ship for this hardware are what this distribution exists
 
 <details><summary>Full commit list</summary>
 
+- perf(runner): prune the eagle K=0 stash only when the live set changes (9b97d10d0b)
+- perf(runner): batch the eagle K=0 stash capture to one clone set per step (9570e9e0f5)
+- perf(sched): eagle K=0 hold engages only on all-decode steps (7e67d27777)
 - fix(spec): eagle K=0 resume rebuilds runner rows via the resumed channel (72e2f45c01)
 - fix(spec): eagle K=0 resume re-growth must reach the runner's block table (6d6c7e8f2e)
 - docs: regenerate DELTA.md for the current delta (b017bd1ce9)

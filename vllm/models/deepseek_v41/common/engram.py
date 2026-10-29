@@ -885,10 +885,6 @@ class DPSharedEngramStorage:
                 scales = scales.view(torch.float16)
             return weight, scales.view(-1, dim // block_size)
 
-        def split_table(table: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            weight = table[:weight_bytes].view(torch.float8_e4m3fn).view(-1, dim)
-            return weight, table[weight_bytes:].view(-1, dim // block_size)
-
         views = None
         if current_platform.is_cuda():
             from vllm.models.deepseek_v41.nvidia.ops import engram_host_table
