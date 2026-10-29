@@ -108,6 +108,109 @@ def test_mamba_speculative_block_relocation_requires_exclusive_ownership():
         manager._relocate_speculative_block([pinned_block], 0)
 
 
+def test_mamba_k0_slot_release_frees_hedge_blocks():
+    """At the K=0 tier the per-draft-token state blocks are idle hedges:
+    releasing them must return pool memory, hold the positions with null
+    blocks (the worker's computed state indexing is position-stable), and
+    the allocate path must not re-reserve them while released."""
+    spec = MambaSpec(
+        block_size=4,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=2,
+    )
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=False, hash_block_size=4)
+    manager = MambaManager(
+        spec,
+        block_pool=pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+    state_blocks = pool.get_new_blocks(2)
+    hedge_blocks = pool.get_new_blocks(2)
+    manager.req_to_blocks["r"] = state_blocks + hedge_blocks
+    manager._allocated_block_reqs.add("r")
+    free_before = pool.get_num_free_blocks()
+
+    assert manager.release_spec_blocks("r") is True
+    assert manager.req_to_blocks["r"] == state_blocks + [
+        pool.null_block,
+        pool.null_block,
+    ]
+    assert pool.get_num_free_blocks() == free_before + 2
+    assert hedge_blocks[0].ref_cnt == hedge_blocks[1].ref_cnt == 0
+    assert manager.release_spec_blocks("r") is False
+
+    manager.set_spec_release_mode(True)
+    # No new blocks while released: the null positions hold the row longer
+    # than num_required, so the need is negative and allocate_new_blocks
+    # early-returns without touching the pool.
+    assert (
+        manager.get_num_blocks_to_allocate(
+            request_id="r",
+            num_tokens=8,
+            new_computed_blocks=[],
+            total_computed_tokens=8,
+            num_local_computed_tokens=8,
+            num_tokens_main_model=8,
+        )
+        <= 0
+    )
+    assert manager.allocate_new_blocks("r", num_tokens=8, num_tokens_main_model=8) == []
+    assert manager.req_to_blocks["r"] == state_blocks + [
+        pool.null_block,
+        pool.null_block,
+    ]
+
+
+def test_mamba_k0_slot_resume_reallocates_fresh_blocks():
+    """On the way back up (K>0) fresh hedge blocks replace the null
+    positions: they are empty allocations, not computed data, so no
+    replay is needed and the allocate path counts them again."""
+    spec = MambaSpec(
+        block_size=4,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=2,
+    )
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=False, hash_block_size=4)
+    manager = MambaManager(
+        spec,
+        block_pool=pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+    state_blocks = pool.get_new_blocks(2)
+    manager.req_to_blocks["r"] = state_blocks + pool.get_new_blocks(2)
+    manager._allocated_block_reqs.add("r")
+    assert manager.release_spec_blocks("r") is True
+    free_released = pool.get_num_free_blocks()
+
+    manager.set_spec_release_mode(False)
+    assert manager.resume_spec_blocks("r") is True
+    fresh = manager.req_to_blocks["r"][2:]
+    assert len(fresh) == 2
+    assert all(block.ref_cnt == 1 for block in fresh)
+    assert pool.get_num_free_blocks() == free_released - 2
+    assert manager.resume_spec_blocks("r") is False
+
+    assert (
+        manager.get_num_blocks_to_allocate(
+            request_id="r",
+            num_tokens=8,
+            new_computed_blocks=[],
+            total_computed_tokens=8,
+            num_local_computed_tokens=8,
+            num_tokens_main_model=8,
+        )
+        == 0
+    )
+
+
 def test_mamba_retirement_crosses_null_gaps():
     spec = MambaSpec(
         block_size=4,

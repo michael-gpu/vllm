@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -343,6 +344,12 @@ class Scheduler(SchedulerInterface):
         if self.num_hash_lookahead_tokens:
             # Lookahead hashes prove the boundary token, so EAGLE needs no drop.
             self.use_eagle_block_drop = False
+
+        # K=0 slot release: free the per-draft-token mamba state blocks while
+        # the adaptive batch is at the K=0 tier (idle hedges there).
+        self._k0_slot_release = (
+            envs.MAMBA_K0_SLOT_RELEASE and self.dynamic_sd_lookup is not None
+        )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -809,6 +816,13 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        # Adaptive-K tier crossing: at K=0 the per-draft-token mamba state
+        # blocks are idle hedges — release them back to the pool; re-reserve
+        # on the way back up. The predictor is the running batch size; the
+        # release is idempotent, so a misprediction self-corrects next step.
+        if self._k0_slot_release:
+            predicted_k = self.dynamic_sd_lookup[len(self.running)]
+            self.kv_cache_manager.set_spec_release_mode(predicted_k == 0)
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
@@ -1679,12 +1693,18 @@ class Scheduler(SchedulerInterface):
             ]
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
+            row_rebuild_reqs = (
+                self.kv_cache_manager.take_spec_row_rebuilds()
+                if self._k0_slot_release
+                else set()
+            )
             cached_reqs_data = self._make_cached_request_data(
                 scheduled_running_reqs,
                 scheduled_resumed_reqs,
                 num_scheduled_tokens,
                 scheduled_spec_decode_tokens,
                 req_to_new_blocks,
+                row_rebuild_reqs,
             )
 
         # Record the request ids that were scheduled in this step (MRV1-only).
@@ -1944,6 +1964,7 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int],
         spec_decode_tokens: dict[str, list[int]],
         req_to_new_blocks: dict[str, KVCacheBlocks],
+        row_rebuild_reqs: set[str] | None = None,
     ) -> CachedRequestData:
         req_ids: list[str] = []
         new_token_ids: list[list[int]] = []
@@ -1978,9 +1999,21 @@ class Scheduler(SchedulerInterface):
             if not self.use_v2_model_runner:  # noqa: SIM102
                 if req_id not in self.prev_step_scheduled_req_ids:
                     all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
-            )
+            if req_id in (row_rebuild_reqs or ()):
+                # The K=0 slot release/resume changed this request's mamba
+                # block positions under an append-only runner row: route
+                # through the resumed channel so the row is rebuilt to
+                # match the scheduler's table exactly.
+                resumed_req_ids.add(req_id)
+                new_block_ids.append(
+                    self.kv_cache_manager.get_blocks(req_id).get_block_ids(
+                        allow_none=True
+                    )
+                )
+            else:
+                new_block_ids.append(
+                    req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+                )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders

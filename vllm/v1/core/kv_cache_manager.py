@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -203,6 +203,9 @@ class KVCacheManager:
             if manager.retains_longer_hit
         )
         self.kv_cache_config = kv_cache_config
+        # K=0 slot release: per-step mode (True while the adaptive batch is
+        # at the K=0 tier) + the runner-row rebuilds collected this step.
+        self._spec_release_mode = False
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -519,6 +522,14 @@ class KVCacheManager:
                 "computed tokens to adopt"
             )
 
+        # K=0 tier: the per-draft-token mamba state blocks are idle hedges
+        # — release them back to the pool (the positions stay, held by
+        # null blocks). The resume un-swap rides allocate_new_blocks.
+        if self._spec_release_mode:
+            for manager in self.coordinator.single_type_managers:
+                if isinstance(manager, MambaManager):
+                    manager.release_spec_blocks(request.request_id)
+
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
             if self.retained_hit_group_ids:
@@ -699,6 +710,51 @@ class KVCacheManager:
         self.coordinator.remove_skipped_blocks(
             request_id, processed_computed_tokens, num_prompt_tokens
         )
+
+    def set_spec_release_mode(self, active: bool) -> None:
+        """Per-step: True while the adaptive batch is at the K=0 tier."""
+        self._spec_release_mode = active
+        for manager in self.coordinator.single_type_managers:
+            if isinstance(manager, MambaManager):
+                manager.set_spec_release_mode(active)
+
+    def take_spec_row_rebuilds(self) -> set[str]:
+        """The request ids whose runner rows must be rebuilt this step."""
+        rebuilds: set[str] = set()
+        for manager in self.coordinator.single_type_managers:
+            if isinstance(manager, MambaManager):
+                rebuilds |= manager.take_spec_row_rebuilds()
+        return rebuilds
+
+    def release_spec_blocks(self, request_ids: Iterable[str]) -> set[str]:
+        """Free the per-draft-token mamba state blocks (the K=0 tier).
+
+        The idle hedge slots return to the pool; positions are held by
+        null blocks so the worker's state indexing is unchanged. Returns
+        the ids whose runner rows must be rebuilt (blocks were freed).
+        """
+        released: set[str] = set()
+        for manager in self.coordinator.single_type_managers:
+            if isinstance(manager, MambaManager):
+                for request_id in request_ids:
+                    if manager.release_spec_blocks(request_id):
+                        released.add(request_id)
+        return released
+
+    def resume_spec_blocks(self, request_ids: Iterable[str]) -> set[str]:
+        """Re-allocate fresh speculative state blocks (the K>0 resume).
+
+        The hedge slots are empty allocations, not computed data, so
+        fresh blocks are correct without any replay. Returns the ids
+        whose runner rows must be rebuilt (the spec positions changed).
+        """
+        resumed: set[str] = set()
+        for manager in self.coordinator.single_type_managers:
+            if isinstance(manager, MambaManager):
+                for request_id in request_ids:
+                    if manager.resume_spec_blocks(request_id):
+                        resumed.add(request_id)
+        return resumed
 
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping and return its blocks without

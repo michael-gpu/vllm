@@ -1460,6 +1460,17 @@ class MambaManager(SingleTypeKVCacheManager):
             # checkpoint position and reserved block index for the current
             # allocation.
             self._checkpoints: dict[str, tuple[int, int]] = {}
+            # Requests whose speculative state blocks are released back to
+            # the pool (the K=0 tier: no speculation, the blocks are idle
+            # hedges). Positions are held by null blocks so the worker's
+            # computed state indexing is unchanged.
+            self._spec_released: set[str] = set()
+            # Per-step: True while the batch is at the K=0 tier (released
+            # requests stay released); False triggers the resume un-swap.
+            self._spec_release_mode = False
+            # Requests whose runner rows must be rebuilt this step (the
+            # spec positions changed under an append-only runner row).
+            self._spec_row_rebuilds: set[str] = set()
             # Requests that registered their own last-prompt-boundary partial
             # tail (producers). A later CoW hands its private copy to the
             # connector; a request that finishes first hands off this table
@@ -1737,9 +1748,12 @@ class MambaManager(SingleTypeKVCacheManager):
 
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
-            num_required_blocks = (
-                cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
+            spec_blocks = (
+                0
+                if request_id in self._spec_released and self._spec_release_mode
+                else self.num_speculative_blocks
             )
+            num_required_blocks = cdiv(num_tokens, self.block_size) + spec_blocks
             num_new_blocks = (
                 num_required_blocks
                 - len(new_computed_blocks)
@@ -1785,7 +1799,7 @@ class MambaManager(SingleTypeKVCacheManager):
             if num_new_blocks > 0:
                 blocks_allocated = request_id in self._allocated_block_reqs
                 physical_block_cap = 1 + int(has_partial_hit) + checkpoint_block
-                if not blocks_allocated:
+                if not blocks_allocated and request_id not in self._spec_released:
                     physical_block_cap += self.num_speculative_blocks
                 num_new_blocks = min(num_new_blocks, physical_block_cap)
 
@@ -1814,11 +1828,21 @@ class MambaManager(SingleTypeKVCacheManager):
             # mamba layers.
             num_tokens = num_tokens_main_model
             req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
+            if request_id in self._spec_released and not self._spec_release_mode:
+                # K>0 resume: swap fresh hedge blocks into the null
+                # positions. The hedge slots are empty allocations, not
+                # computed data, so fresh blocks are correct without any
+                # replay. Returns True when positions changed (the runner
+                # row must be rebuilt); collected by the caller.
+                self.resume_spec_blocks(request_id)
+            spec_blocks = (
+                0
+                if request_id in self._spec_released and self._spec_release_mode
+                else self.num_speculative_blocks
+            )
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
-            num_required_blocks = (
-                cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
-            )
+            num_required_blocks = cdiv(num_tokens, self.block_size) + spec_blocks
             checkpoint_block = int(request_id in self._checkpoints)
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
@@ -1846,9 +1870,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     # saves the hit state.
                     self.last_state_block_idx[request_id] = prev_block_len - 1
 
-                num_skipped_blocks = (
-                    num_required_blocks - self.num_speculative_blocks - 1
-                )
+                num_skipped_blocks = num_required_blocks - spec_blocks - 1
                 # null blocks
                 if prev_block_len < num_skipped_blocks:
                     # minus the internal checkpoint block
@@ -1858,7 +1880,7 @@ class MambaManager(SingleTypeKVCacheManager):
                         [self._null_block for _ in range(prev_block_len, null_end)]
                     )
 
-                if blocks_allocated:
+                if blocks_allocated and request_id not in self._spec_released:
                     # Relocate exclusively owned scratch blocks this step leaves
                     # behind. In a checkpoint step, one at the checkpoint index
                     # stays: the worker exports the checkpoint into that column.
@@ -1921,6 +1943,56 @@ class MambaManager(SingleTypeKVCacheManager):
                 self._partial_hit_reqs.pop(request_id, None)
                 returned_blocks.extend(new_blocks)
                 return returned_blocks
+
+    def set_spec_release_mode(self, active: bool) -> None:
+        self._spec_release_mode = active
+
+    def take_spec_row_rebuilds(self) -> set[str]:
+        rebuilds = self._spec_row_rebuilds
+        self._spec_row_rebuilds = set()
+        return rebuilds
+
+    def release_spec_blocks(self, request_id: str) -> bool:
+        """Free the trailing speculative state blocks at the K=0 tier.
+
+        The block positions stay (null blocks) so the worker's computed
+        state indexing is unchanged; the pool memory returns. Idempotent.
+        Returns True only when blocks were freed (the runner row must be
+        rebuilt); a request with no blocks yet is just marked.
+        """
+        if self.num_speculative_blocks <= 0 or request_id in self._spec_released:
+            return False
+        self._spec_released.add(request_id)
+        req_blocks = self.req_to_blocks.get(request_id)
+        if not req_blocks or request_id not in self._allocated_block_reqs:
+            return False
+        tail_start = len(req_blocks) - self.num_speculative_blocks
+        if tail_start < 0:
+            return False
+        self.block_pool.free_blocks(req_blocks[tail_start:])
+        req_blocks[tail_start:] = [self._null_block] * self.num_speculative_blocks
+        self._spec_row_rebuilds.add(request_id)
+        return True
+
+    def resume_spec_blocks(self, request_id: str) -> bool:
+        """Re-allocate fresh speculative state blocks (the K>0 resume).
+
+        The hedge slots are empty allocations, not computed data: the
+        committed state lives in the base blocks, so fresh blocks are
+        correct without any replay.
+        """
+        if request_id not in self._spec_released:
+            return False
+        self._spec_released.discard(request_id)
+        req_blocks = self.req_to_blocks.get(request_id)
+        if not req_blocks or len(req_blocks) < self.num_speculative_blocks:
+            return False
+        tail_start = len(req_blocks) - self.num_speculative_blocks
+        req_blocks[tail_start:] = self.block_pool.get_new_blocks(
+            self.num_speculative_blocks
+        )
+        self._spec_row_rebuilds.add(request_id)
+        return True
 
     def _relocate_speculative_block(
         self, req_blocks: list[KVCacheBlock], block_idx: int
