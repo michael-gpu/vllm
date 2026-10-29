@@ -1,16 +1,16 @@
 <!-- markdownlint-disable MD060 -->
 # Delta vs upstream vLLM
 
-`main` = upstream `main` (nightly merge) + the commits below: 24 source commits (73 files changed, 4900 insertions(+), 277 deletions(-)).
+`main` = upstream `main` (nightly merge) + the commits below: 25 source commits (73 files changed, 4900 insertions(+), 277 deletions(-)).
 
 Diff base: upstream commit `4e0ad57203` — the tip this tree last merged from origin. Reproduce at this commit with:
-`git log --no-merges 4e0ad57203..9d2030103a -- vllm/ csrc/` and `git diff --stat 4e0ad57203..9d2030103a -- vllm/ csrc/`.
+`git log --no-merges 4e0ad57203..91c751dbac -- vllm/ csrc/` and `git diff --stat 4e0ad57203..91c751dbac -- vllm/ csrc/`.
 
 Areas upstream does not ship for this hardware are what this distribution exists to carry; general fixes are contributed upstream first (see README). Regenerated automatically by the nightly integrate.
 
 | Area | Commits |
 |---|---|
-| general fixes | 8 |
+| general fixes | 9 |
 | spec-decode fixes | 8 |
 | model bring-up (GLM5Next / Qwen4Exp / DSV41) | 3 |
 | KV-cache / offload fixes | 1 |
@@ -21,6 +21,7 @@ Areas upstream does not ship for this hardware are what this distribution exists
 
 <details><summary>Full commit list</summary>
 
+- docs: correct claims in 7e67d27777/9570e9e0f5/9b97d10d0b (the stash-clone chase) (91c751dbac)
 - docs: regenerate DELTA.md for the current delta (9d2030103a)
 - perf(runner): prune the eagle K=0 stash only when the live set changes (9b97d10d0b)
 - perf(runner): batch the eagle K=0 stash capture to one clone set per step (9570e9e0f5)
