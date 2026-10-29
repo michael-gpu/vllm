@@ -1,18 +1,19 @@
 <!-- markdownlint-disable MD060 -->
 # Delta vs upstream vLLM
 
-`main` = upstream `main` (nightly merge) + the commits below: 25 source commits (73 files changed, 4900 insertions(+), 277 deletions(-)).
+`main` = upstream `main` (nightly merge) + the commits below: 32 source commits (70 files changed, 4342 insertions(+), 260 deletions(-)).
 
-Diff base: upstream commit `4e0ad57203` — the tip this tree last merged from origin. Reproduce at this commit with:
-`git log --no-merges 4e0ad57203..91c751dbac -- vllm/ csrc/` and `git diff --stat 4e0ad57203..91c751dbac -- vllm/ csrc/`.
+Diff base: upstream commit `434eadcbf8` — the tip this tree last merged from origin. Reproduce at this commit with:
+`git log --no-merges 434eadcbf8..ecb4723254 -- vllm/ csrc/` and `git diff --stat 434eadcbf8..ecb4723254 -- vllm/ csrc/`.
 
 Areas upstream does not ship for this hardware are what this distribution exists to carry; general fixes are contributed upstream first (see README). Regenerated automatically by the nightly integrate.
 
 | Area | Commits |
 |---|---|
-| general fixes | 9 |
-| spec-decode fixes | 8 |
+| general fixes | 12 |
+| spec-decode fixes | 11 |
 | model bring-up (GLM5Next / Qwen4Exp / DSV41) | 3 |
+| fork delta (squash: spec-decode fixes + KV-cache / offload fixes) | 1 |
 | KV-cache / offload fixes | 1 |
 | fork delta (squash: sparse attention (TRITON_MLA_SPARSE) + KV-cache / offload fixes) | 1 |
 | fork delta (squash: sparse attention (TRITON_MLA_SPARSE) + spec-decode fixes) | 1 |
@@ -21,6 +22,13 @@ Areas upstream does not ship for this hardware are what this distribution exists
 
 <details><summary>Full commit list</summary>
 
+- Revert "Merge branch 'perf/eagle-k0-lifecycle' into next" (9107e1fba5)
+- Revert "fix(spec): eagle K=0 resume re-growth must reach the runner's block table" (183ef23a1a)
+- Revert "fix(spec): eagle K=0 resume rebuilds runner rows via the resumed channel" (9b31b8d4e8)
+- Revert "perf(sched): eagle K=0 hold engages only on all-decode steps" (b794cff8a5)
+- Revert "perf(runner): batch the eagle K=0 stash capture to one clone set per step" (5d4cfa746a)
+- Revert "perf(runner): prune the eagle K=0 stash only when the live set changes" (008d530292)
+- Revert "docs: correct claims in 7e67d27777/9570e9e0f5/9b97d10d0b (the stash-clone chase)" (ca70f82b4f)
 - docs: correct claims in 7e67d27777/9570e9e0f5/9b97d10d0b (the stash-clone chase) (91c751dbac)
 - docs: regenerate DELTA.md for the current delta (9d2030103a)
 - perf(runner): prune the eagle K=0 stash only when the live set changes (9b97d10d0b)
