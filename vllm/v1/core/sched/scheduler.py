@@ -1841,9 +1841,9 @@ class Scheduler(SchedulerInterface):
                 # update_from_output after every drafter step. A step that
                 # schedules prefill chunks does not hold: the hold would
                 # only defer the chunks' drafter sync to the replay while
-                # the stash retains every chunk row's hidden state (GBs at
-                # wave scale), so those steps run the ordinary per-step sync
-                # prefill and the hold engages once the batch is all-decode.
+                # the stash retains every chunk row's hidden state, so
+                # those steps run the ordinary per-step sync prefill and
+                # the hold engages once the batch is all-decode.
                 for req_id in num_scheduled_tokens:
                     self._eagle_sync_points.setdefault(req_id, 0)
                 self._eagle_hold = True
