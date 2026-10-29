@@ -5089,6 +5089,18 @@ class GPUModelRunner(
             if rid not in live:
                 del self._eagle_k0_stash[rid]
         qsl = common_attn_metadata.query_start_loc_cpu
+        total = int(qsl[-1])
+        if total > 0:
+            # One contiguous clone per step; per-request rows are views into
+            # it. Per-row clones launched 4 kernels per request per held step
+            # (128+ launches at a c32 decode stretch) — the launch overhead,
+            # not the copied bytes, was the hold's per-step cost.
+            step_tokens = target_token_ids[:total].clone()
+            step_positions = target_positions[:total].clone()
+            step_hidden = target_hidden_states[:total].clone()
+            step_next = next_token_ids[: len(req_ids)].clone()
+        else:
+            step_tokens = step_positions = step_hidden = step_next = None
         for i, rid in enumerate(req_ids):
             start = int(qsl[i])
             end = int(qsl[i + 1])
@@ -5097,10 +5109,10 @@ class GPUModelRunner(
             entry = self._eagle_k0_stash.setdefault(
                 rid, {"tokens": [], "positions": [], "hidden": [], "next": []}
             )
-            entry["tokens"].append(target_token_ids[start:end].clone())
-            entry["positions"].append(target_positions[start:end].clone())
-            entry["hidden"].append(target_hidden_states[start:end].clone())
-            entry["next"].append(next_token_ids[i : i + 1].clone())
+            entry["tokens"].append(step_tokens[start:end])
+            entry["positions"].append(step_positions[start:end])
+            entry["hidden"].append(step_hidden[start:end])
+            entry["next"].append(step_next[i : i + 1])
 
     def _eagle_k0_catchup(
         self,
