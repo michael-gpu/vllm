@@ -9,7 +9,7 @@
 <h1 align="center">vllm-ampere-extended</h1>
 
 <p align="center">
-  <b>The newest open models don't run on stock vLLM for your GPU. This fork makes them run.</b>
+  <b>The newest open models don't run on stock vLLM with Ampere GPUs. This fork makes them run.</b>
 </p>
 
 <p align="center">
@@ -26,6 +26,36 @@
 </p>
 
 ---
+
+<p align="center">
+  <img alt="Token-arrival replay: this fork streaming Qwen3.8-Flash-Next on an A100; stock vLLM fails to boot on the same card" src="recipes/models/Qwen/qwen3.8-flash-next-demo.gif" width=85%>
+</p>
+
+## Today
+
+**Qwen3.8-Flash-Next on a single 96 GB A100: 596 tok/s single-stream, 1,164
+tok/s at 64 concurrent.** Stock vLLM 0.32.0 on the same card **fails to
+boot** — OOM in KV-cache init: bf16 KV at 262k context does not fit next to
+the weights. **GLM-5.3-Flash on 4× A100 serves live production traffic at up
+to 354 tok/s decode** with MTP. Every number links to a recipe with the
+harness command line that produced it.
+
+| Model | Hardware | This fork | Stock vLLM 0.32.0 |
+|---|---|---|---|
+| [Qwen3.8-Flash-Next](recipes/models/Qwen/qwen3.8-flash-next-ampere.md) | 1× A100 96 GB | **596 tok/s** c1 · **1,164 tok/s** c64 · 30k-prompt TTFT 6.35 s | **fails to boot** — OOM in `_initialize_kv_caches`, needs 18.95 GiB with 16.06 free ([trace](recipes/models/Qwen/qwen3.8-flash-next-stock-failure.txt)) |
+| [GLM-5.3-Flash](recipes/models/GLM/glm-5.3-flash-tp4-ampere.md) | 4× A100 96 GB (TP4) | **141–354 tok/s** decode (MTP N=2) · 128k TTFT 47 s cold → 1 s cached · GSM8K 97.2% | not measured on this hardware |
+| GLM-5.3 (SplitQuant) | 5× A100 96 GB (TP2×PP3) | **57.5 tok/s** c1 with MTP N=1 (39.4 without) | not measured |
+| DeepSeek V4.1 | 6× A100 96 GB | runs in production here — recipe and measured numbers pending | not measured |
+
+Hardware note: everything above is measured on 96 GB A100s (SM80) — the rarer
+SKU. The Qwen checkpoint does **not** fit an 80 GB A100: ~80 GiB weights alone
+exceed the ~79.5 GiB usable (the 52 GiB PLE n-gram table already lives in
+pinned host RAM), so there is no KV pool left to shrink. 80 GB and smaller
+cards need smaller checkpoints.
+
+**Quick start:** install the
+[pinned release](https://github.com/practical-inference/vllm-ampere-extended/releases/latest)
+and serve a recipe config — reproduction commands are in each recipe.
 
 ## Why this exists
 
@@ -102,6 +132,28 @@ page. Every release notes the upstream vLLM commit it was built from.
   reproduces on an upstream release first; the bug template asks.
 - **Issues with these builds** (regressions between tags, Ampere-specific
   behavior, wheel/install problems): open an issue here.
+
+## Field tests wanted
+
+We validate nightly on A100 80 GB (SM80) — we cannot test what we do not
+own. The stack targets Ampere and newer; a result in either direction helps
+(a success fills the matrix, a failure with the exact error does too):
+
+| Combo | Status |
+|---|---|
+| RTX 3090 / 3090 Ti (24 GB, SM86) | untested |
+| RTX Pro 6000 Workstation (SM121) | untested |
+| A6000 (48 GB) / A100 40 GB | untested |
+| A100 80 GB ×2 (TP2) — GLM-5.3-Flash | untested |
+
+Half-hour test on any model that fits your VRAM:
+
+```bash
+recipes/bench/field_test.sh <model-path> [port] [extra vllm serve args]
+```
+
+It serves the model, runs the fixed benchmark matrix, and prints a report
+ready to paste into an issue.
 
 ## Community
 

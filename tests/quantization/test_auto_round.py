@@ -679,8 +679,9 @@ def test_wna16_cuda_low_bit_linear_routes_to_humming(
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.inc.schemes."
         "inc_wna16_scheme._build_humming_linear_method",
-        lambda layer_config: captured.update({"layer_config": layer_config})
-        or expected_method,
+        lambda layer_config: (
+            captured.update({"layer_config": layer_config}) or expected_method
+        ),
     )
 
     layer_config = make_layer_config(bits=bits, packing_format=packing_format)
@@ -705,10 +706,10 @@ def test_wna16_cuda_low_bit_moe_routes_to_humming(monkeypatch, bits) -> None:
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.inc.schemes."
         "inc_wna16_scheme._build_humming_moe_method",
-        lambda layer, layer_config: captured.update(
-            {"layer": layer, "layer_config": layer_config}
-        )
-        or expected_method,
+        lambda layer, layer_config: (
+            captured.update({"layer": layer, "layer_config": layer_config})
+            or expected_method
+        ),
     )
 
     layer = object.__new__(RoutedExperts)
@@ -1053,7 +1054,7 @@ def test_inc_mxfp4_linear_method_registers_and_processes_weights(
     method.process_weights_after_loading(layer)
 
     assert layer.weight.data.data_ptr() == packed_data.data_ptr()
-    assert not hasattr(layer, "weight_packed")
+    assert layer.weight_packed is layer.weight
     assert captured["processed_layer"] is layer
 
 
@@ -1100,8 +1101,9 @@ def test_inc_mxfp4_moe_method_preserves_checkpoint_packing(
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_moe."
         "make_mxfp4_moe_quant_config",
-        lambda **kwargs: captured.update({"quant_config_kwargs": kwargs})
-        or expected_quant_config,
+        lambda **kwargs: (
+            captured.update({"quant_config_kwargs": kwargs}) or expected_quant_config
+        ),
     )
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_moe."
@@ -1141,8 +1143,8 @@ def test_inc_mxfp4_moe_method_preserves_checkpoint_packing(
 
     assert layer.w13_weight.data.data_ptr() == w13_packed_data.data_ptr()
     assert layer.w2_weight.data.data_ptr() == w2_packed_data.data_ptr()
-    assert not hasattr(layer, "w13_weight_packed")
-    assert not hasattr(layer, "w2_weight_packed")
+    assert layer.w13_weight_packed is layer.w13_weight
+    assert layer.w2_weight_packed is layer.w2_weight
     assert captured["quant_config_kwargs"]["w1_scale"] is layer.w13_weight_scale
     assert captured["quant_config_kwargs"]["w2_scale"] is layer.w2_weight_scale
     assert captured["kernel_kwargs"]["moe_quant_config"] is expected_quant_config

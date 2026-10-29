@@ -3606,8 +3606,8 @@ class TestPeerReplacement:
             {"old-req": [10, 11], "healthy-req": [12]}
         )
         self.nixl.invalid_remote_agents.add("old")
-        self.transport.check_xfer_state.side_effect = (
-            lambda h: "ERR" if h == 10 else "PROC"
+        self.transport.check_xfer_state.side_effect = lambda h: (
+            "ERR" if h == 10 else "PROC"
         )
         old_handle = self.worker.dst_xfer_side_handles["old"][0]
 
@@ -3617,8 +3617,8 @@ class TestPeerReplacement:
         self.worker.start_load_kv(self._request("old", req_id="blocked"))
         self.transport.make_prepped_xfer.assert_not_called()
 
-        self.transport.check_xfer_state.side_effect = (
-            lambda h: "DONE" if h == 11 else "PROC"
+        self.transport.check_xfer_state.side_effect = lambda h: (
+            "DONE" if h == 11 else "PROC"
         )
         result = self.worker.get_transfer_results()
         assert (
@@ -3695,8 +3695,8 @@ class TestPeerReplacement:
     def test_invalid_peer_empty_recv_is_reported_only_when_awaited(self, awaiting_kvs):
         self._fail_old_peer()
         self.worker._recving_transfers["old-req"].append(11)
-        self.transport.check_xfer_state.side_effect = (
-            lambda h: "PROC" if h == 11 else "ERR"
+        self.transport.check_xfer_state.side_effect = lambda h: (
+            "PROC" if h == 11 else "ERR"
         )
         self.worker.get_transfer_results()
         self.transport.make_prepped_xfer.reset_mock()
@@ -5132,3 +5132,71 @@ def test_explicit_kv_role_no_deprecation_warning(default_vllm_config, dist_init)
             mock_logger.warning_once.assert_not_called(),
             (f"kv_role={role!r} should not emit deprecation warning"),
         )
+
+
+class _BackendRecordingNixlWrapper(FakeNixlWrapper):
+    def __init__(self, agent_name: str, config=None, *args, **kwargs):
+        super().__init__(agent_name, *args, **kwargs)
+        self.config = config
+        self.created_backends: list[tuple[str, dict[str, str]]] = []
+
+    def create_backend(self, backend: str, init_params: dict[str, str]) -> None:
+        self.created_backends.append((backend, dict(init_params)))
+
+
+@pytest.mark.parametrize(
+    "extra_config, agent_backends, created_backends",
+    [
+        # No UCX params: the agent config creates the backends, as before.
+        ({}, ["UCX"], []),
+        (
+            {"ucx_backend_params": {"ucx_error_handling_mode": "none"}},
+            [],
+            [("UCX", {"num_threads": "4", "ucx_error_handling_mode": "none"})],
+        ),
+        (
+            {
+                "backends": ["UCX", "LIBFABRIC"],
+                "ucx_backend_params": {"ucx_error_handling_mode": "none"},
+            },
+            [],
+            [("UCX", {"ucx_error_handling_mode": "none"}), ("LIBFABRIC", {})],
+        ),
+        # UCX not selected: the params have nothing to apply to.
+        (
+            {
+                "backends": ["LIBFABRIC"],
+                "ucx_backend_params": {"ucx_error_handling_mode": "none"},
+            },
+            ["LIBFABRIC"],
+            [],
+        ),
+    ],
+)
+def test_ucx_backend_params(dist_init, extra_config, agent_backends, created_backends):
+    """kv_connector_extra_config.ucx_backend_params reaches UCX's create_backend."""
+
+    def agent_config(backends=None, num_threads=0, capture_telemetry=False):
+        return SimpleNamespace(
+            backends=["UCX"] if backends is None else backends,
+            num_threads=num_threads,
+        )
+
+    vllm_config = create_vllm_config(kv_connector_extra_config=extra_config)
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+            _BackendRecordingNixlWrapper,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.nixl_agent_config",
+            agent_config,
+        ),
+        set_current_vllm_config(vllm_config),
+    ):
+        connector = NixlConnector(
+            vllm_config, KVConnectorRole.WORKER, make_kv_cache_config(block_size=16)
+        )
+    wrapper = connector.connector_worker.nixl_wrapper
+    assert wrapper.config.backends == agent_backends
+    assert wrapper.created_backends == created_backends

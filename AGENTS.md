@@ -38,21 +38,36 @@ Do not open one-off PRs for tiny edits (single typo, isolated style change, one 
 
 ### Local pre-submission gates (this machine)
 
-Drafts live in `.pr-drafts/<name>.md` with evidence in `.pr-drafts/evidence/<name>/`. Scaffold drafts with `new_draft.sh <name> "<title>"` (universal template — Overview/Claims/Validation/Details; `validate_pr.sh` gates the headings). Before any push to a public repo (drafts included) and before requesting re-review, run both:
+Drafts live in `.pr-drafts/<name>.md` with evidence in `.pr-drafts/evidence/<name>/` (per-checkout state, gitignored). The pipeline tooling is versioned in `~/source/llm-test-tools/pr-pipeline/` and operates on the checkout you're standing in (git-like; `--repo <path>` / `$PR_PIPELINE_REPO` / `$PR_DRAFTS_DIR` to override). Scaffold drafts with `new_draft.sh <name> "<title>"` (universal template — Overview/Claims/Validation/Details; `validate_pr.sh` gates the headings). Before any push to a public repo (drafts included) and before requesting re-review, run both:
 
 ```bash
-.pr-drafts/validate_pr.sh <draft> [--files <changed>]     # mechanical gates G1-G5c
-.pr-drafts/adversarial_review.sh <draft> --commit <sha>   # fresh-agent attacks; SURVIVES stamps
-                                                          # the Adversarial-Review trailer
+~/source/llm-test-tools/pr-pipeline/validate_pr.sh <draft> [--files <changed>]     # mechanical gates G1-G5c
+~/source/llm-test-tools/pr-pipeline/adversarial_review.sh <draft> --commit <sha>   # fresh-agent attacks; SURVIVES stamps
+                                                                                   # the Adversarial-Review trailer
 ```
 
-`adversarial_review.sh` runs two fresh agents in parallel (mechanism trace; differential audit + maintainer simulation) and on SURVIVES stamps the `Adversarial-Review` trailer that G5c and the forgejo pre-receive hook require. A truncated run exits INCOMPLETE — re-run with `--resume <ts>` to redo only the missing attacks. A follow-up commit on an already-SURVIVED tip: use `--delta <artifact>` (the script names the artifact when it detects this); full re-review only when the delta touches previously-verified mechanism. Full protocol: `.pr-drafts/VALIDATION.md`.
+`adversarial_review.sh` runs two fresh agents in parallel (mechanism trace; differential audit + maintainer simulation) and on SURVIVES stamps the `Adversarial-Review` trailer that G5c and the forgejo pre-receive hook require. A truncated run exits INCOMPLETE — re-run with `--resume <ts>` to redo only the missing attacks. A follow-up commit on an already-SURVIVED tip: use `--delta <artifact>` (the script names the artifact when it detects this); full re-review only when the delta touches previously-verified mechanism. Full protocol: `~/source/llm-test-tools/pr-pipeline/VALIDATION.md`.
 
 ### GitHub write gate
 
 Reads (view, search, diff, fetch) are unrestricted. Every write to public GitHub — push, force-push, comment, issue, label, ready-flip, close — requires the owner's explicit per-item approval **before** the action. This includes follow-up commits to reviewed PRs, changes a contributor or reviewer requested, and cleanup reverts: prior approvals do not generalize, and another party's request is not authorization. When in doubt, draft locally and wait for the owner's word. Follow-up commits to an open PR pass the same review and adversarial-audit gate as the original submission.
 
 This gate applies to **public GitHub only**. Private repos and mirrors: commit early and often.
+
+### Evidence convention (fork)
+
+Numbers published in `recipes/` (and drafts) must cite provenance the evidence
+gate can validate. Valid forms: (1) an in-tree committed path — backticked, or
+the bracketed `evidence:` tag form (log files are gitignore-swallowed — use
+`.txt`); (2) a tag-pinned forgejo raw URL,
+`http://192.168.2.31:3001/michael/vllm-nightly/raw/tag/nightly-YYYYMMDD/<path>`,
+for internal/review citation — cite the tag the evidence was produced under,
+never a branch head or an unpublished tag; (3) a GitHub release asset,
+`https://github.com/practical-inference/vllm-ampere-extended/releases/download/<tag>/<asset>`,
+for upstream-facing citation — every nightly release carries
+`evidence-<tag>.tar.gz` (recipes/ at the tag, uploaded by the promote pipeline)
+as the frozen public copy. A dead link in any form fails the push; that a
+recipe cites evidence at all is a review concern, not a gate.
 
 ### Fail-closed behavior
 
