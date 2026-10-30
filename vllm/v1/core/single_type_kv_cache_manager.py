@@ -265,6 +265,26 @@ class SingleTypeKVCacheManager(ABC):
             num_new_blocks += 1
         return num_new_blocks + num_evictable_blocks
 
+    def spec_batch_tier_need(self, requests: list[Request], tier: int) -> int:
+        """End-state block need summed over the not-yet-allocated requests
+        (the formed-batch fit projection). Tier-independent for groups
+        without speculative state; the mamba align manager overrides with
+        the tier-dependent window term. Prefix-hit-blind: it reserves the
+        full row for every request, which can only over-price an
+        admission."""
+        del tier
+        need = 0
+        for request in requests:
+            if request.request_id in self.req_to_blocks:
+                continue
+            num_required_blocks = cdiv(request.num_tokens, self.block_size)
+            if self.max_admission_blocks_per_request is not None:
+                num_required_blocks = min(
+                    num_required_blocks, self.max_admission_blocks_per_request
+                )
+            need += num_required_blocks
+        return need
+
     def add_local_computed_blocks(
         self,
         request_id: str,
@@ -2043,13 +2063,15 @@ class MambaManager(SingleTypeKVCacheManager):
         tier: a fresh waiting request under a spec-decode align pool."""
         return self._spec_admission_priceable(request_id)
 
-    def spec_batch_full_tier_need(self, requests: list[Request]) -> int:
-        """End-state mamba row need at the full spec tier, summed over the
-        not-yet-allocated requests (the whole-batch fit projection).
+    def spec_batch_tier_need(self, requests: list[Request], tier: int) -> int:
+        """End-state mamba row need at the given spec tier, summed over the
+        not-yet-allocated requests (the formed-batch fit projection).
 
         The projection is prefix-hit-blind: it reserves the full row for
         every request, which can only over-price an admission — the
-        per-row priced retry stays the net for the opposite error.
+        per-row priced retry stays the net for the opposite error. At the
+        K=0 tier the window is null row slots (no pool blocks); at any
+        K>0 tier the full physical window is reserved.
         """
         if self.num_speculative_blocks <= 0 or self.mamba_cache_mode != "align":
             return 0
@@ -2057,9 +2079,9 @@ class MambaManager(SingleTypeKVCacheManager):
         for request in requests:
             if request.request_id in self._allocated_block_reqs:
                 continue
-            need += (
-                cdiv(request.num_tokens, self.block_size) + self.num_speculative_blocks
-            )
+            need += cdiv(request.num_tokens, self.block_size)
+            if tier > 0:
+                need += self.num_speculative_blocks
         return need
 
     def mark_spec_admission_tier0(self, request_id: str) -> bool:

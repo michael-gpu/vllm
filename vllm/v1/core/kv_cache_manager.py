@@ -15,7 +15,10 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    MambaManager,
+    SingleTypeKVCacheManager,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -739,21 +742,21 @@ class KVCacheManager:
             if isinstance(manager, MambaManager):
                 manager.unmark_spec_admission(request_id)
 
-    def spec_batch_fits_full_tier(
-        self, requests: list[Request], reserved_blocks: int = 0
+    def spec_batch_fits_tier(
+        self, requests: list[Request], tier: int, reserved_blocks: int = 0
     ) -> bool:
-        """Whole-batch fit check for the batch-aware admission prior:
+        """Whole-batch fit check for the formed-batch uniform-tier rule:
         whether every not-yet-allocated request in `requests` can hold its
-        full speculative mamba window simultaneously (end-state rows),
-        plus the admission watermark. Managers sharing one block pool are
-        priced against it together."""
-        pools: dict[int, list[MambaManager]] = {}
+        end-state footprint at the given spec tier simultaneously, plus
+        the admission watermark, in every constrained pool. Managers
+        sharing one block pool are priced against it together."""
+        pools: dict[int, list[SingleTypeKVCacheManager]] = {}
         for manager in self.coordinator.single_type_managers:
-            if isinstance(manager, MambaManager):
-                pools.setdefault(id(manager.block_pool), []).append(manager)
+            pools.setdefault(id(manager.block_pool), []).append(manager)
         for pool_managers in pools.values():
             need = sum(
-                manager.spec_batch_full_tier_need(requests) for manager in pool_managers
+                manager.spec_batch_tier_need(requests, tier)
+                for manager in pool_managers
             )
             if need == 0:
                 continue

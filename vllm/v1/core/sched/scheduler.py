@@ -819,16 +819,39 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
-        # The count-based table stays the prior: while it schedules K>0,
-        # rows pinned at the K=0 tier are promotion candidates (priced in
-        # the running loop below). lookup[0] is intentionally 0, so an
-        # empty running set gates promotions off.
+        # Formed-batch uniform-tier rule: the spec tier for this step is
+        # the dynamic table's answer for the batch being FORMED (running
+        # + waiting), demoted until that batch's end-state fits every
+        # constrained pool. One tier for the whole step — every row runs
+        # at the same tier, and the tier rises/falls freely between
+        # steps. If no tier fits, the table tier stands and admission
+        # stalls (tier-loyal — the old behavior).
         spec_tier_lookup = self.dynamic_sd_lookup
-        table_tier = (
-            spec_tier_lookup[len(self.running)]
-            if self._priced_admission and spec_tier_lookup is not None
-            else 0
-        )
+        step_tier = 0
+        formed_waiting: list[Request] = []
+        if self._priced_admission and spec_tier_lookup is not None:
+            formed_count = min(
+                len(self.running) + len(self.kv_holding_waiting) + len(self.waiting),
+                len(spec_tier_lookup) - 1,
+            )
+            table_tier = spec_tier_lookup[formed_count]
+            step_tier = table_tier
+            batch_slots = max(self.scheduler_config.max_num_seqs - len(self.running), 0)
+            formed_waiting = (list(self.kv_holding_waiting) + list(self.waiting))[
+                :batch_slots
+            ]
+            while step_tier > 0 and not self.kv_cache_manager.spec_batch_fits_tier(
+                formed_waiting, step_tier
+            ):
+                step_tier -= 1
+            if (
+                step_tier == 0
+                and table_tier > 0
+                and not self.kv_cache_manager.spec_batch_fits_tier(formed_waiting, 0)
+            ):
+                # No tier fits the formed batch: the table tier stands and
+                # admission stalls (tier-loyal — the old behavior).
+                step_tier = table_tier
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
@@ -1053,15 +1076,16 @@ class Scheduler(SchedulerInterface):
                 request, request.num_computed_tokens, num_new_tokens
             )
 
-            # Priced promotion: while the table schedules K>0, a row pinned
-            # at the K=0 tier is refilled to the full spec tier when the
-            # pool fits it (plus the admission watermark). The pin — not
-            # the count — held it down; the price — not the count — lifts
-            # it. Only decode-phase rows promote: the window is idle draft
-            # state until the row decodes.
+            # Priced promotion: while the step's uniform tier schedules
+            # K>0, a row whose window is null row slots is refilled to the
+            # full spec tier when the pool fits it (plus the admission
+            # watermark). The tier — not a per-request pin — governs the
+            # step; the price — not the count — lifts the row. Only
+            # decode-phase rows promote: the window is idle draft state
+            # until the row decodes.
             if (
                 self._priced_admission
-                and table_tier > 0
+                and step_tier > 0
                 and not (request.is_prefill_chunk)
             ):
                 self.kv_cache_manager.promote_spec_blocks(
@@ -1495,47 +1519,21 @@ class Scheduler(SchedulerInterface):
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
 
-                # Pool-priced admission: the count-based table is the prior
-                # for the tier this request joins — looked up at the batch
-                # being FORMED (scheduled this step + still waiting), not
-                # the staged running count: a burst's head rows must not
-                # commit expensive tiers the tail cannot afford. At a K=0
-                # prior the window is born as null row slots; at a K>0
-                # prior a footprint failure retries at the K=0 tier —
-                # degrade the optional state at admission before stalling.
+                # Formed-batch uniform tier: the step's tier is the prior
+                # for the tier this request joins — every row in the step
+                # runs at the same tier, demoted (once, at the step level)
+                # until the formed batch's end-state fits every constrained
+                # pool. At a K=0 step tier the window is born as null row
+                # slots; at a K>0 step tier a footprint failure retries at
+                # the K=0 tier — degrade the optional state at admission
+                # before stalling.
                 priceable = False
                 prior_tier = 0
-                spec_tier_lookup = self.dynamic_sd_lookup
-                if self._priced_admission and spec_tier_lookup is not None:
-                    forming_count = min(
-                        len(num_scheduled_tokens)
-                        + len(self.kv_holding_waiting)
-                        + len(self.waiting),
-                        len(spec_tier_lookup) - 1,
-                    )
-                    prior_tier = spec_tier_lookup[forming_count]
+                if self._priced_admission:
+                    prior_tier = step_tier
                     priceable = self.kv_cache_manager.spec_admission_priceable(
                         request_id
                     )
-                    if priceable and prior_tier > 0:
-                        # Whole-batch fit check: when the forming batch
-                        # cannot hold the full spec window for every row
-                        # still to come, admit at the K=0 tier instead of
-                        # letting the head rows eat the pool the tail
-                        # needs (the per-row priced retry below stays the
-                        # net for projection error).
-                        batch_slots = max(
-                            self.scheduler_config.max_num_seqs
-                            - len(num_scheduled_tokens),
-                            0,
-                        )
-                        if batch_slots and not (
-                            self.kv_cache_manager.spec_batch_fits_full_tier(
-                                list(request_queue)[:batch_slots],
-                                reserved_blocks,
-                            )
-                        ):
-                            prior_tier = 0
                     if priceable and prior_tier == 0:
                         self.kv_cache_manager.mark_spec_admission_tier0(request_id)
 
@@ -1850,12 +1848,17 @@ class Scheduler(SchedulerInterface):
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
-        # Dynamic speculative decoding: compute optimal K
+        # Dynamic speculative decoding: compute optimal K. Under the
+        # formed-batch uniform-tier rule the step's demoted tier governs
+        # the schedule; otherwise the count-based table answers.
         num_spec_tokens_to_schedule = self.num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                len(num_scheduled_tokens)
-            ]
+            if self._priced_admission:
+                num_spec_tokens_to_schedule = step_tier
+            else:
+                num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                    len(num_scheduled_tokens)
+                ]
 
         scheduled_encoder_input_stats = None
         if (

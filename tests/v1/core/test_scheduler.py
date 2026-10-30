@@ -7927,7 +7927,7 @@ def test_async_load_reservation_prevents_wedge_e2e():
     resolved by reservation-based admission control instead of preemption.
 
     A (8 blocks) and B (5 blocks) both want an async KV load, sharing a 4-block
-    prefix, in a 10-block pool (9 usable). Admitting both loads would wedge:
+    prefix, in a 9-block pool (9 usable). Admitting both loads would wedge:
     once their recvs finish neither can complete its local prefill (8+5 > 9).
 
     Here the reservation gate refuses to admit B's load while A's full sequence
@@ -8854,12 +8854,13 @@ def test_priced_admission_degrades_to_k0_before_stalling(monkeypatch):
 
 
 def test_priced_admission_pin_gates_promotion(monkeypatch):
-    """A row pinned at the K=0 tier is promoted only when the count-based
-    table schedules K>0 AND the refill fits the pool: the pin — not the
-    count — holds the tier down, and the promotion is priced, not
-    count-driven."""
+    """Formed-batch uniform tier: when the formed batch's end-state does
+    not fit at any K>0 tier, the WHOLE batch admits at the K=0 tier (one
+    tier per step — no per-request degradation); when the batch drains
+    and the step tier rises, the null-window rows are promoted (priced)
+    together and routed through the resumed channel."""
     scheduler = _mamba_priced_scheduler(
-        monkeypatch, num_blocks=8, schedule_table=[(1, 4, 2), (5, 16, 1), (17, 128, 0)]
+        monkeypatch, num_blocks=9, schedule_table=[(1, 4, 2), (5, 16, 1), (17, 128, 0)]
     )
     kv_cache_manager = scheduler.kv_cache_manager
     mamba_manager = kv_cache_manager.coordinator.single_type_managers[0]
@@ -8876,27 +8877,34 @@ def test_priced_admission_pin_gates_promotion(monkeypatch):
         scheduler.add_request(req)
 
     output = scheduler.schedule()
-    # The forming batch of 3 cannot hold 3 full windows in an 8-block
-    # pool: the head row is priced down to the K=0 tier at admission; the
-    # remaining forming batch (b, c) fits at the full tier.
-    assert kv_cache_manager.is_spec_released(req_a.request_id)
-    assert not kv_cache_manager.is_spec_released(req_b.request_id)
-    assert not kv_cache_manager.is_spec_released(req_c.request_id)
+    # The forming batch of 3 cannot hold 3 full windows in a 9-block
+    # pool (12 > 10 at K=2 and K=1; 3 K=0 rows at 3 blocks fit): the step
+    # tier is demoted to K=0 and every row admits pinned — all-or-nothing
+    # per batch, no mixed-tier step.
+    assert output.num_spec_tokens_to_schedule == 0
+    for req in (req_a, req_b, req_c):
+        assert kv_cache_manager.is_spec_released(req.request_id)
     _model_output(scheduler, output, [[100], [100], [100]])
 
-    # req_b finishes and returns its blocks; the table still schedules
-    # K>0 at the remaining batch, and the refill now fits: the pinned row
-    # is promoted and its runner row is routed through the resumed
+    # req_b finishes and returns its blocks; the formed batch drains to 2
+    # and the table's answer rises to K=2: the step tier rises with it,
+    # the refill now fits (4 window blocks vs 4 free), and both
+    # null-window rows are promoted and routed through the resumed
     # channel.
-    scheduler.update_draft_token_ids(DraftTokenIds([req_a.request_id], [[1, 2]]))
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([req_a.request_id, req_c.request_id], [[1, 2], [1, 2]])
+    )
     output = scheduler.schedule()
     assert output.num_scheduled_tokens[req_a.request_id] == 1
-    assert not kv_cache_manager.is_spec_released(req_a.request_id)
-    assert all(
-        block.ref_cnt == 1
-        for block in mamba_manager.req_to_blocks[req_a.request_id][-2:]
-    )
-    assert req_a.request_id in output.scheduled_cached_reqs.resumed_req_ids
+    assert output.num_scheduled_tokens[req_c.request_id] == 1
+    assert output.num_spec_tokens_to_schedule == 2
+    for req in (req_a, req_c):
+        assert not kv_cache_manager.is_spec_released(req.request_id)
+        assert all(
+            block.ref_cnt == 1
+            for block in mamba_manager.req_to_blocks[req.request_id][-2:]
+        )
+        assert req.request_id in output.scheduled_cached_reqs.resumed_req_ids
 
 
 def test_priced_admission_no_promotion_while_table_schedules_k0(monkeypatch):
@@ -8954,3 +8962,121 @@ def test_priced_admission_batch_aware_prior_pins_burst(monkeypatch):
     assert set(output.num_scheduled_tokens) == {req.request_id for req in reqs}
     for req in reqs:
         assert kv_cache_manager.is_spec_released(req.request_id)
+
+
+def _hybrid_priced_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    num_blocks: int,
+    schedule_table: list[tuple[int, int, int]],
+):
+    """A full-attention + mamba-align scheduler with a dynamic spec-tier
+    table and a tight shared pool, for the formed-batch uniform-tier
+    tests that need a non-mamba pool to bind."""
+    monkeypatch.setenv("VLLM_MAMBA_PRICED_ADMISSION", "1")
+    return create_scheduler(
+        max_num_seqs=16,
+        num_blocks=num_blocks,
+        block_size=16,
+        num_speculative_tokens=2,
+        num_speculative_tokens_per_batch_size=schedule_table,
+        kv_cache_spec=MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            num_speculative_blocks=2,
+        ),
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attn"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=16,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    num_speculative_blocks=2,
+                ),
+            ),
+        ],
+    )
+
+
+def test_uniform_tier_burst_admits_at_demoted_tier(monkeypatch):
+    """Formed-batch uniform tier, c32-style burst: the table's answer for
+    the formed batch does not fit the pool's end-state, so the step tier
+    is demoted until it does — the whole burst admits together at the
+    demoted tier instead of the head rows committing the expensive tier
+    and stranding the tail in a staggered queue."""
+    scheduler = _mamba_priced_scheduler(
+        monkeypatch, num_blocks=20, schedule_table=[(1, 128, 2)]
+    )
+    kv_cache_manager = scheduler.kv_cache_manager
+    reqs = create_requests(num_requests=16, num_tokens=16, max_tokens=4, block_size=16)
+    for req in reqs:
+        scheduler.add_request(req)
+
+    output = scheduler.schedule()
+
+    # 16 rows need 48 blocks at the K=2 tier but only 16 at K=0 (the
+    # windows are null row slots): the step tier demotes 2 -> 1 -> 0 and
+    # the whole burst admits in one step at the demoted tier.
+    assert set(output.num_scheduled_tokens) == {req.request_id for req in reqs}
+    assert output.num_spec_tokens_to_schedule == 0
+    for req in reqs:
+        assert kv_cache_manager.is_spec_released(req.request_id)
+
+
+def test_uniform_tier_boundary_recovers_at_k0(monkeypatch):
+    """Formed-batch uniform tier, c11-style boundary: the formed batch
+    lands exactly on the table's K=0 band, so the whole batch admits at
+    K=0 and the boundary the staged count lookup stalled at is
+    recovered."""
+    scheduler = _mamba_priced_scheduler(
+        monkeypatch, num_blocks=20, schedule_table=[(1, 10, 2), (11, 128, 0)]
+    )
+    kv_cache_manager = scheduler.kv_cache_manager
+    reqs = create_requests(num_requests=11, num_tokens=16, max_tokens=4, block_size=16)
+    for req in reqs:
+        scheduler.add_request(req)
+
+    output = scheduler.schedule()
+
+    # The formed batch of 11 is the table's K=0 band: every row admits
+    # pinned at K=0 in one step — a staged count lookup would have run
+    # the head rows at the K=2 tier (counts 1-10) until the pool ran out.
+    assert set(output.num_scheduled_tokens) == {req.request_id for req in reqs}
+    assert output.num_spec_tokens_to_schedule == 0
+    for req in reqs:
+        assert kv_cache_manager.is_spec_released(req.request_id)
+
+
+def test_uniform_tier_attention_bound_no_demotion(monkeypatch):
+    """Formed-batch uniform tier, attention-bound long prompts: when NO
+    tier fits the formed batch's end-state (the attention pool binds, not
+    the mamba pool), the step tier is NOT demoted — the table tier stands
+    and admission stalls tier-loyally. A mamba-only fit check would
+    demote to K=0 and over-admit rows the attention pool cannot hold."""
+    scheduler = _hybrid_priced_scheduler(
+        monkeypatch, num_blocks=37, schedule_table=[(1, 128, 2)]
+    )
+    kv_cache_manager = scheduler.kv_cache_manager
+    reqs = create_requests(num_requests=16, num_tokens=32, max_tokens=4, block_size=16)
+    for req in reqs:
+        scheduler.add_request(req)
+
+    output = scheduler.schedule()
+
+    # 16 rows need 96 blocks at K>0 and 64 at K=0 against a 37-block
+    # pool: no tier fits, so the table tier (K=2) stands. The head rows
+    # admit tier-loyally while they fit and the tail queues — the old
+    # stall behavior, with no rows demoted behind the scheduler's back.
+    assert set(output.num_scheduled_tokens) == {req.request_id for req in reqs[:7]}
+    assert output.num_spec_tokens_to_schedule == 2
+    for req in reqs:
+        assert not kv_cache_manager.is_spec_released(req.request_id)
