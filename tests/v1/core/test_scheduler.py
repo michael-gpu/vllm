@@ -55,7 +55,7 @@ from vllm.v1.core.sched.diffusion_scheduler import (
 )
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler, _k0_release_with_dwell
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
 from vllm.v1.engine.core import EngineCore
@@ -8795,3 +8795,35 @@ def test_cpu_encoder_input_updates_preserve_shm_handles(use_v2_model_runner):
         {request.request_id: {1: None}} if use_v2_model_runner else {}
     )
     assert request.mm_features[0].data is handle
+
+
+def test_k0_release_dwell_arms_only_after_consecutive_k0_steps():
+    # The boundary hover (K=0/K=1 oscillation) must never arm the release:
+    # each K>0 step resets the dwell, so the pool never flaps.
+    dwell = 8
+    count = 0
+    for predicted_k in [0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0]:
+        release, count = _k0_release_with_dwell(predicted_k, count, dwell)
+        assert release is False
+    assert count == 1
+
+    # A steady K=0 batch arms the release exactly at the dwell step.
+    count = 0
+    for step in range(1, dwell):
+        release, count = _k0_release_with_dwell(0, count, dwell)
+        assert release is False
+    release, count = _k0_release_with_dwell(0, count, dwell)
+    assert release is True
+    # It stays armed while the batch remains at K=0.
+    release, count = _k0_release_with_dwell(0, count, dwell)
+    assert release is True
+
+    # The resume is immediate: one K>0 step disarms and resets the dwell.
+    release, count = _k0_release_with_dwell(1, count, dwell)
+    assert release is False
+    assert count == 0
+
+    # dwell=1 recovers the undamped per-crossing release.
+    release, count = _k0_release_with_dwell(0, 0, 1)
+    assert release is True
+    assert count == 1

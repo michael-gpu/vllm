@@ -84,6 +84,21 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _k0_release_with_dwell(
+    predicted_k: int, dwell_count: int, dwell_steps: int
+) -> tuple[bool, int]:
+    """Asymmetric hysteresis for the K=0 slot release.
+
+    A batch hovering at the K=0/K=1 boundary must not flap the pool with a
+    whole-batch release/resume per crossing, so the release arms only after
+    `dwell_steps` consecutive K=0 steps; the resume (K>0) is immediate.
+    """
+    if predicted_k != 0:
+        return False, 0
+    dwell_count = min(dwell_count + 1, dwell_steps)
+    return dwell_count >= dwell_steps, dwell_count
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -350,6 +365,10 @@ class Scheduler(SchedulerInterface):
         self._k0_slot_release = (
             envs.VLLM_MAMBA_K0_SLOT_RELEASE and self.dynamic_sd_lookup is not None
         )
+        self._k0_release_dwell_steps = (
+            max(envs.VLLM_MAMBA_K0_RELEASE_DWELL, 1) if self._k0_slot_release else 0
+        )
+        self._k0_release_dwell_count = 0
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -829,7 +848,12 @@ class Scheduler(SchedulerInterface):
             predicted_k = (
                 self.dynamic_sd_lookup[len(self.running)] if self.running else 1
             )
-            self.kv_cache_manager.set_spec_release_mode(predicted_k == 0)
+            release, self._k0_release_dwell_count = _k0_release_with_dwell(
+                predicted_k,
+                self._k0_release_dwell_count,
+                self._k0_release_dwell_steps,
+            )
+            self.kv_cache_manager.set_spec_release_mode(release)
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
