@@ -2036,6 +2036,25 @@ class MambaManager(SingleTypeKVCacheManager):
         tier: a fresh waiting request under a spec-decode align pool."""
         return self._spec_admission_priceable(request_id)
 
+    def spec_batch_full_tier_need(self, requests: list[Request]) -> int:
+        """End-state mamba row need at the full spec tier, summed over the
+        not-yet-allocated requests (the whole-batch fit projection).
+
+        The projection is prefix-hit-blind: it reserves the full row for
+        every request, which can only over-price an admission — the
+        per-row priced retry stays the net for the opposite error.
+        """
+        if self.num_speculative_blocks <= 0 or self.mamba_cache_mode != "align":
+            return 0
+        need = 0
+        for request in requests:
+            if request.request_id in self._allocated_block_reqs:
+                continue
+            need += (
+                cdiv(request.num_tokens, self.block_size) + self.num_speculative_blocks
+            )
+        return need
+
     def mark_spec_admission_tier0(self, request_id: str) -> bool:
         """Mark a waiting request for a K=0-tier admission: its speculative
         window is born as null row slots (no pool blocks). Returns False
@@ -2056,10 +2075,8 @@ class MambaManager(SingleTypeKVCacheManager):
     def promote_spec_blocks(self, request_id: str, reserve: int = 0) -> bool:
         """Price and run the pinned row's promotion to the full spec tier.
 
-        Refills the window's null positions with fresh hedge blocks only
-        when the pool fits them (plus `reserve`); otherwise the row stays
-        pinned. Returns True when the row was promoted (the pin cleared,
-        the runner row marked for rebuild).
+        Refills the window's null positions with fresh hedge blocks only when
+        the pool fits them (plus `reserve`); otherwise the row stays pinned.
         """
         if request_id not in self._spec_released:
             return False

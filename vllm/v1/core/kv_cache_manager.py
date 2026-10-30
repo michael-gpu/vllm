@@ -739,6 +739,29 @@ class KVCacheManager:
             if isinstance(manager, MambaManager):
                 manager.unmark_spec_admission(request_id)
 
+    def spec_batch_fits_full_tier(
+        self, requests: list[Request], reserved_blocks: int = 0
+    ) -> bool:
+        """Whole-batch fit check for the batch-aware admission prior:
+        whether every not-yet-allocated request in `requests` can hold its
+        full speculative mamba window simultaneously (end-state rows),
+        plus the admission watermark. Managers sharing one block pool are
+        priced against it together."""
+        pools: dict[int, list[MambaManager]] = {}
+        for manager in self.coordinator.single_type_managers:
+            if isinstance(manager, MambaManager):
+                pools.setdefault(id(manager.block_pool), []).append(manager)
+        for pool_managers in pools.values():
+            need = sum(
+                manager.spec_batch_full_tier_need(requests) for manager in pool_managers
+            )
+            if need == 0:
+                continue
+            free = pool_managers[0].block_pool.get_num_free_blocks()
+            if need + self.watermark_blocks + reserved_blocks > free:
+                return False
+        return True
+
     def is_spec_released(self, request_id: str) -> bool:
         """Whether the request is pinned at the K=0 spec tier."""
         return any(

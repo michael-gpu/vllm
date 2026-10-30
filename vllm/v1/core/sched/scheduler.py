@@ -1496,22 +1496,46 @@ class Scheduler(SchedulerInterface):
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
 
                 # Pool-priced admission: the count-based table is the prior
-                # for the tier this request joins. At a K=0 prior the window
-                # is born as null row slots; at a K>0 prior a footprint
-                # failure retries at the K=0 tier — degrade the optional
-                # state at admission before stalling.
+                # for the tier this request joins — looked up at the batch
+                # being FORMED (scheduled this step + still waiting), not
+                # the staged running count: a burst's head rows must not
+                # commit expensive tiers the tail cannot afford. At a K=0
+                # prior the window is born as null row slots; at a K>0
+                # prior a footprint failure retries at the K=0 tier —
+                # degrade the optional state at admission before stalling.
                 priceable = False
                 prior_tier = 0
                 spec_tier_lookup = self.dynamic_sd_lookup
                 if self._priced_admission and spec_tier_lookup is not None:
-                    prior_count = min(
-                        len(num_scheduled_tokens) + 1,
+                    forming_count = min(
+                        len(num_scheduled_tokens)
+                        + len(self.kv_holding_waiting)
+                        + len(self.waiting),
                         len(spec_tier_lookup) - 1,
                     )
-                    prior_tier = spec_tier_lookup[prior_count]
+                    prior_tier = spec_tier_lookup[forming_count]
                     priceable = self.kv_cache_manager.spec_admission_priceable(
                         request_id
                     )
+                    if priceable and prior_tier > 0:
+                        # Whole-batch fit check: when the forming batch
+                        # cannot hold the full spec window for every row
+                        # still to come, admit at the K=0 tier instead of
+                        # letting the head rows eat the pool the tail
+                        # needs (the per-row priced retry below stays the
+                        # net for projection error).
+                        batch_slots = max(
+                            self.scheduler_config.max_num_seqs
+                            - len(num_scheduled_tokens),
+                            0,
+                        )
+                        if batch_slots and not (
+                            self.kv_cache_manager.spec_batch_fits_full_tier(
+                                list(request_queue)[:batch_slots],
+                                reserved_blocks,
+                            )
+                        ):
+                            prior_tier = 0
                     if priceable and prior_tier == 0:
                         self.kv_cache_manager.mark_spec_admission_tier0(request_id)
 
