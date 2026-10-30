@@ -821,7 +821,14 @@ class Scheduler(SchedulerInterface):
         # on the way back up. The predictor is the running batch size; the
         # release is idempotent, so a misprediction self-corrects next step.
         if self._k0_slot_release:
-            predicted_k = self.dynamic_sd_lookup[len(self.running)]
+            # lookup[0] is intentionally 0 (unused index) — an empty running
+            # set must NOT arm the release mode: the imminent admissions'
+            # tier is unknown, and arming here marks every fresh admission
+            # released before the real tier is known. Default OFF; the
+            # release fires on the next step if the batch lands at K=0.
+            predicted_k = (
+                self.dynamic_sd_lookup[len(self.running)] if self.running else 1
+            )
             self.kv_cache_manager.set_spec_release_mode(predicted_k == 0)
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]

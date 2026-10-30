@@ -1947,7 +1947,28 @@ class MambaManager(SingleTypeKVCacheManager):
                     fill_pool = sum(
                         1 for block in req_blocks[live_start:] if block.is_null
                     )
-                assert num_new_blocks <= max_new_blocks
+                if num_new_blocks > max_new_blocks:
+                    row_kinds = "".join(
+                        "N" if block.is_null else "R" for block in req_blocks
+                    )
+                    row_view = (
+                        row_kinds[:40] + ".." + row_kinds[-40:]
+                        if len(row_kinds) > 84
+                        else row_kinds
+                    )
+                    raise AssertionError(
+                        "mamba row accounting exceeded the per-step bound: "
+                        f"released={released} mode={self._spec_release_mode} "
+                        f"blocks_allocated={blocks_allocated} "
+                        f"num_required={num_required_blocks} "
+                        f"row_len={len(req_blocks)} row={row_view} "
+                        f"num_skipped={num_skipped_blocks} "
+                        f"checkpoint={checkpoint_block} "
+                        f"partial_hit={has_partial_hit} fill_pool={fill_pool} "
+                        f"free_window={free_window} "
+                        f"num_new={num_new_blocks} max_new={max_new_blocks} "
+                        f"spec_blocks={spec_blocks}"
+                    )
                 new_blocks = self.block_pool.get_new_blocks(
                     num_new_blocks + fill_pool - free_window
                 )
