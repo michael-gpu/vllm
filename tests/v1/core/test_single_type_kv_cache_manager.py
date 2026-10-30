@@ -198,6 +198,53 @@ def test_mamba_pinned_row_growth_fills_window_nulls():
     assert pool.get_num_free_blocks() == free_after_admission - 4
 
 
+def test_mamba_pinned_row_growth_survives_multi_block_advance():
+    """A chunked prefill can advance the state boundary by several blocks
+    in ONE step (a ~68K-token prompt across max-batched-token chunks). A
+    normal row absorbs the advance free via window relocation; a pinned
+    row has no scratch to relocate, so its row-length growth is explicit
+    — the per-step bound must budget the same window's worth or the row
+    accounting assert kills the engine (the 68K ramp crash,
+    2026-10-30)."""
+    manager, pool = _align_manager()
+    assert manager.mark_spec_admission_tier0("r") is True
+    manager.allocate_new_blocks("r", num_tokens=8, num_tokens_main_model=8)
+    row = manager.req_to_blocks["r"]
+    assert len(row) == 4
+    free_after_admission = pool.get_num_free_blocks()
+
+    # One step advances the boundary from cdiv(8,4)=2 to cdiv(20,4)=5
+    # blocks: num_new=3 against a chain bound of 1 — legal only because
+    # the pinned row budgets the window's worth.
+    manager.allocate_new_blocks("r", num_tokens=20, num_tokens_main_model=20)
+    row = manager.req_to_blocks["r"]
+    # The advance jumped past the swallowed window nulls (live_start
+    # lands beyond the row): they stay null as unexported checkpoint
+    # slots, the running-state slot and the new tail append physical —
+    # pure append, no in-place refill, no runner rebuild.
+    assert [b.is_null for b in row] == [True, False, True, True, False, False, False]
+    assert manager.take_spec_row_rebuilds() == set()
+    assert pool.get_num_free_blocks() == free_after_admission - 3
+
+    # The next single-block advance keeps the row accounting: the chain
+    # grows one slot and the swallowed window nulls stay unexported.
+    manager.allocate_new_blocks("r", num_tokens=24, num_tokens_main_model=24)
+    row = manager.req_to_blocks["r"]
+    assert len(row) == 8
+    assert [b.is_null for b in row] == [
+        True,
+        False,
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
+    assert manager.take_spec_row_rebuilds() == set()
+    assert pool.get_num_free_blocks() == free_after_admission - 4
+
+
 def test_mamba_promotion_reallocates_fresh_blocks():
     """The priced promotion refills the pinned window's null positions
     with fresh hedge blocks: they are empty allocations, not computed

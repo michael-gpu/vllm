@@ -1914,6 +1914,13 @@ class MambaManager(SingleTypeKVCacheManager):
                 max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
                 if not blocks_allocated:
                     max_new_blocks += self.num_speculative_blocks
+                elif released:
+                    # A pinned row has no window scratch to relocate: the
+                    # boundary advance the normal row absorbs free via
+                    # relocation is explicit row-length growth here. Budget
+                    # the same window's worth in the per-step bound — the
+                    # advance this bound already allows a normal row.
+                    max_new_blocks += self.num_speculative_blocks
                 # A request admitted at the K=0 tier holds its speculative
                 # window as null positions: they are row slots, not pool
                 # blocks, so the physical take is smaller by the window.
