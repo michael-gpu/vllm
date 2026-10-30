@@ -84,21 +84,6 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
-def _k0_release_with_dwell(
-    predicted_k: int, dwell_count: int, dwell_steps: int
-) -> tuple[bool, int]:
-    """Asymmetric hysteresis for the K=0 slot release.
-
-    A batch hovering at the K=0/K=1 boundary must not flap the pool with a
-    whole-batch release/resume per crossing, so the release arms only after
-    `dwell_steps` consecutive K=0 steps; the resume (K>0) is immediate.
-    """
-    if predicted_k != 0:
-        return False, 0
-    dwell_count = min(dwell_count + 1, dwell_steps)
-    return dwell_count >= dwell_steps, dwell_count
-
-
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -360,15 +345,14 @@ class Scheduler(SchedulerInterface):
             # Lookahead hashes prove the boundary token, so EAGLE needs no drop.
             self.use_eagle_block_drop = False
 
-        # K=0 slot release: free the per-draft-token mamba state blocks while
-        # the adaptive batch is at the K=0 tier (idle hedges there).
-        self._k0_slot_release = (
-            envs.VLLM_MAMBA_K0_SLOT_RELEASE and self.dynamic_sd_lookup is not None
+        # Pool-priced spec-tier admission: when a waiting request cannot
+        # admit at its scheduled tier's state footprint, retry at the K=0
+        # tier (the speculative window as null row slots) before stalling.
+        # The admitted tier is pinned per request; promotion back up is
+        # priced, not count-driven.
+        self._priced_admission = (
+            envs.VLLM_MAMBA_PRICED_ADMISSION and self.dynamic_sd_lookup is not None
         )
-        self._k0_release_dwell_steps = (
-            max(envs.VLLM_MAMBA_K0_RELEASE_DWELL, 1) if self._k0_slot_release else 0
-        )
-        self._k0_release_dwell_count = 0
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -835,25 +819,16 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
-        # Adaptive-K tier crossing: at K=0 the per-draft-token mamba state
-        # blocks are idle hedges — release them back to the pool; re-reserve
-        # on the way back up. The predictor is the running batch size; the
-        # release is idempotent, so a misprediction self-corrects next step.
-        if self._k0_slot_release:
-            # lookup[0] is intentionally 0 (unused index) — an empty running
-            # set must NOT arm the release mode: the imminent admissions'
-            # tier is unknown, and arming here marks every fresh admission
-            # released before the real tier is known. Default OFF; the
-            # release fires on the next step if the batch lands at K=0.
-            predicted_k = (
-                self.dynamic_sd_lookup[len(self.running)] if self.running else 1
-            )
-            release, self._k0_release_dwell_count = _k0_release_with_dwell(
-                predicted_k,
-                self._k0_release_dwell_count,
-                self._k0_release_dwell_steps,
-            )
-            self.kv_cache_manager.set_spec_release_mode(release)
+        # The count-based table stays the prior: while it schedules K>0,
+        # rows pinned at the K=0 tier are promotion candidates (priced in
+        # the running loop below). lookup[0] is intentionally 0, so an
+        # empty running set gates promotions off.
+        spec_tier_lookup = self.dynamic_sd_lookup
+        table_tier = (
+            spec_tier_lookup[len(self.running)]
+            if self._priced_admission and spec_tier_lookup is not None
+            else 0
+        )
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
@@ -897,6 +872,16 @@ class Scheduler(SchedulerInterface):
             ):
                 req_index += 1
                 continue
+
+            # A row pinned at the K=0 tier runs no drafts: its speculative
+            # window is null row slots, and the pin — not the count-based
+            # table — governs its tier until the priced promotion lifts it.
+            if (
+                self._priced_admission
+                and request.spec_token_ids
+                and self.kv_cache_manager.is_spec_released(request.request_id)
+            ):
+                request.spec_token_ids = []
 
             num_new_tokens = (
                 request.num_tokens_with_spec
@@ -1067,6 +1052,21 @@ class Scheduler(SchedulerInterface):
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
             )
+
+            # Priced promotion: while the table schedules K>0, a row pinned
+            # at the K=0 tier is refilled to the full spec tier when the
+            # pool fits it (plus the admission watermark). The pin — not
+            # the count — held it down; the price — not the count — lifts
+            # it. Only decode-phase rows promote: the window is idle draft
+            # state until the row decodes.
+            if (
+                self._priced_admission
+                and table_tier > 0
+                and not (request.is_prefill_chunk)
+            ):
+                self.kv_cache_manager.promote_spec_blocks(
+                    request_id, reserve=self.kv_cache_manager.watermark_blocks
+                )
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -1494,6 +1494,27 @@ class Scheduler(SchedulerInterface):
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
+
+                # Pool-priced admission: the count-based table is the prior
+                # for the tier this request joins. At a K=0 prior the window
+                # is born as null row slots; at a K>0 prior a footprint
+                # failure retries at the K=0 tier — degrade the optional
+                # state at admission before stalling.
+                priceable = False
+                prior_tier = 0
+                spec_tier_lookup = self.dynamic_sd_lookup
+                if self._priced_admission and spec_tier_lookup is not None:
+                    prior_count = min(
+                        len(num_scheduled_tokens) + 1,
+                        len(spec_tier_lookup) - 1,
+                    )
+                    prior_tier = spec_tier_lookup[prior_count]
+                    priceable = self.kv_cache_manager.spec_admission_priceable(
+                        request_id
+                    )
+                    if priceable and prior_tier == 0:
+                        self.kv_cache_manager.mark_spec_admission_tier0(request_id)
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_tokens_past_hit,
@@ -1511,7 +1532,38 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
+                    # A failure at the scheduled tier is not a stall when
+                    # the priced retry below can still admit the request.
+                    count_failure=not (priceable and prior_tier > 0),
                 )
+
+                if new_blocks is None and priceable:
+                    self.kv_cache_manager.unmark_spec_admission(request_id)
+                    if prior_tier > 0:
+                        # The scheduled tier's footprint does not fit:
+                        # retry at the K=0 tier and pin the request there
+                        # instead of stalling the admission.
+                        self.kv_cache_manager.mark_spec_admission_tier0(request_id)
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_tokens_past_hit,
+                            num_new_computed_tokens=num_new_local_computed_tokens,
+                            new_computed_blocks=new_computed_blocks,
+                            num_lookahead_tokens=effective_lookahead_tokens,
+                            num_external_computed_tokens=(num_external_computed_tokens),
+                            delay_cache_blocks=load_kv_async,
+                            skip_zeroing_group_ids=(
+                                self.connector.get_loaded_kv_cache_group_ids(request)
+                                if load_kv_async and self.connector is not None
+                                else ()
+                            ),
+                            num_encoder_tokens=num_encoder_tokens,
+                            full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                            reserved_blocks=reserved_blocks,
+                            has_scheduled_reqs=bool(self.running),
+                        )
+                        if new_blocks is None:
+                            self.kv_cache_manager.unmark_spec_admission(request_id)
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -1726,7 +1778,7 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             row_rebuild_reqs = (
                 self.kv_cache_manager.take_spec_row_rebuilds()
-                if self._k0_slot_release
+                if self._priced_admission
                 else set()
             )
             cached_reqs_data = self._make_cached_request_data(

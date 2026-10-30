@@ -60,8 +60,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
-    VLLM_MAMBA_K0_SLOT_RELEASE: bool = False
-    VLLM_MAMBA_K0_RELEASE_DWELL: int = 8
+    VLLM_MAMBA_PRICED_ADMISSION: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
@@ -1103,18 +1102,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
-    # Release the per-draft-token mamba state blocks back to the pool while
-    # the adaptive-MTP batch is at the K=0 tier (they are idle hedges there);
-    # fresh blocks are reserved on the way back up. Default: off
-    "VLLM_MAMBA_K0_SLOT_RELEASE": lambda: bool(
-        int(os.getenv("VLLM_MAMBA_K0_SLOT_RELEASE", "0"))
-    ),
-    # Consecutive K=0 steps the batch must dwell before the slot release arms
-    # (asymmetric hysteresis: the resume on K>0 is immediate). Damps the
-    # whole-batch release/resume churn when the batch hovers at the tier
-    # boundary. 1 recovers the undamped per-crossing release. Default: 8
-    "VLLM_MAMBA_K0_RELEASE_DWELL": lambda: int(
-        os.getenv("VLLM_MAMBA_K0_RELEASE_DWELL", "8")
+    # Pool-priced spec-tier admission for hybrid-state models: when a waiting
+    # request cannot admit at its scheduled spec tier's state footprint, retry
+    # the admission at the K=0 tier (the speculative window as null row slots)
+    # before stalling. The admitted tier is pinned per request and promoted
+    # (priced) when the count-based tier rises above it. Default: off
+    "VLLM_MAMBA_PRICED_ADMISSION": lambda: bool(
+        int(os.getenv("VLLM_MAMBA_PRICED_ADMISSION", "0"))
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

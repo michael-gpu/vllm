@@ -108,19 +108,21 @@ def test_mamba_speculative_block_relocation_requires_exclusive_ownership():
         manager._relocate_speculative_block([pinned_block], 0)
 
 
-def test_mamba_k0_slot_release_frees_hedge_blocks():
-    """At the K=0 tier the per-draft-token state blocks are idle hedges:
-    releasing them must return pool memory, hold the positions with null
-    blocks (the worker's computed state indexing is position-stable), and
-    the allocate path must not re-reserve them while released."""
+def _align_manager(
+    num_spec_blocks: int = 2,
+    num_gpu_blocks: int = 16,
+    mode: str = "align",
+) -> tuple[MambaManager, BlockPool]:
     spec = MambaSpec(
         block_size=4,
         shapes=((1, 1),),
         dtypes=(torch.float32,),
-        mamba_cache_mode="align",
-        num_speculative_blocks=2,
+        mamba_cache_mode=mode,
+        num_speculative_blocks=num_spec_blocks,
     )
-    pool = BlockPool(num_gpu_blocks=8, enable_caching=False, hash_block_size=4)
+    pool = BlockPool(
+        num_gpu_blocks=num_gpu_blocks, enable_caching=False, hash_block_size=4
+    )
     manager = MambaManager(
         spec,
         block_pool=pool,
@@ -128,174 +130,18 @@ def test_mamba_k0_slot_release_frees_hedge_blocks():
         kv_cache_group_id=0,
         scheduler_block_size=4,
     )
-    state_blocks = pool.get_new_blocks(2)
-    hedge_blocks = pool.get_new_blocks(2)
-    manager.req_to_blocks["r"] = state_blocks + hedge_blocks
-    manager._allocated_block_reqs.add("r")
-    free_before = pool.get_num_free_blocks()
-
-    assert manager.release_spec_blocks("r") is True
-    assert manager.req_to_blocks["r"] == state_blocks + [
-        pool.null_block,
-        pool.null_block,
-    ]
-    assert pool.get_num_free_blocks() == free_before + 2
-    assert hedge_blocks[0].ref_cnt == hedge_blocks[1].ref_cnt == 0
-    assert manager.release_spec_blocks("r") is False
-
-    manager.set_spec_release_mode(True)
-    # No new blocks while released: the null positions hold the row longer
-    # than num_required, so the need is negative and allocate_new_blocks
-    # early-returns without touching the pool.
-    assert (
-        manager.get_num_blocks_to_allocate(
-            request_id="r",
-            num_tokens=8,
-            new_computed_blocks=[],
-            total_computed_tokens=8,
-            num_local_computed_tokens=8,
-            num_tokens_main_model=8,
-        )
-        <= 0
-    )
-    assert manager.allocate_new_blocks("r", num_tokens=8, num_tokens_main_model=8) == []
-    assert manager.req_to_blocks["r"] == state_blocks + [
-        pool.null_block,
-        pool.null_block,
-    ]
+    return manager, pool
 
 
-def test_mamba_k0_slot_resume_reallocates_fresh_blocks():
-    """On the way back up (K>0) fresh hedge blocks replace the null
-    positions: they are empty allocations, not computed data, so no
-    replay is needed and the allocate path counts them again."""
-    spec = MambaSpec(
-        block_size=4,
-        shapes=((1, 1),),
-        dtypes=(torch.float32,),
-        mamba_cache_mode="align",
-        num_speculative_blocks=2,
-    )
-    pool = BlockPool(num_gpu_blocks=8, enable_caching=False, hash_block_size=4)
-    manager = MambaManager(
-        spec,
-        block_pool=pool,
-        enable_caching=False,
-        kv_cache_group_id=0,
-        scheduler_block_size=4,
-    )
-    state_blocks = pool.get_new_blocks(2)
-    manager.req_to_blocks["r"] = state_blocks + pool.get_new_blocks(2)
-    manager._allocated_block_reqs.add("r")
-    assert manager.release_spec_blocks("r") is True
-    free_released = pool.get_num_free_blocks()
-
-    manager.set_spec_release_mode(False)
-    assert manager.resume_spec_blocks("r") is True
-    fresh = manager.req_to_blocks["r"][2:]
-    assert len(fresh) == 2
-    assert all(block.ref_cnt == 1 for block in fresh)
-    assert pool.get_num_free_blocks() == free_released - 2
-    assert manager.resume_spec_blocks("r") is False
-
-    assert (
-        manager.get_num_blocks_to_allocate(
-            request_id="r",
-            num_tokens=8,
-            new_computed_blocks=[],
-            total_computed_tokens=8,
-            num_local_computed_tokens=8,
-            num_tokens_main_model=8,
-        )
-        == 0
-    )
-
-
-def test_mamba_k0_resume_never_replaces_committed_tail():
-    """A request admitted at the K=0 tier has no hedge window: its row is
-    committed blocks only. The resume must refill null positions only —
-    the blind tail replacement destroyed committed state and left the
-    request unmarked with no hedge, which crashed the relocation loop
-    with negative indices ("must be exclusively owned and unhashed")."""
-    spec = MambaSpec(
-        block_size=4,
-        shapes=((1, 1),),
-        dtypes=(torch.float32,),
-        mamba_cache_mode="align",
-        num_speculative_blocks=2,
-    )
-    pool = BlockPool(num_gpu_blocks=16, enable_caching=False, hash_block_size=4)
-    manager = MambaManager(
-        spec,
-        block_pool=pool,
-        enable_caching=False,
-        kv_cache_group_id=0,
-        scheduler_block_size=4,
-    )
-    committed = pool.get_new_blocks(3)
-    manager.req_to_blocks["r"] = list(committed)
-    manager._allocated_block_reqs.add("r")
-    manager._spec_released.add("r")
-    free_before = pool.get_num_free_blocks()
-
-    manager.set_spec_release_mode(False)
-    assert manager.resume_spec_blocks("r") is False
-    assert manager.req_to_blocks["r"] == committed
-    assert pool.get_num_free_blocks() == free_before
-
-
-def test_mamba_k0_resume_keeps_mark_when_row_missing():
-    """The hook marks row-less new requests at the K=0 tier. The resume
-    must not clear that mark before hedge blocks are actually placed —
-    an unmarked hedge-less row is what walked the relocation loop off
-    the end of the row in the first rig crash."""
-    spec = MambaSpec(
-        block_size=4,
-        shapes=((1, 1),),
-        dtypes=(torch.float32,),
-        mamba_cache_mode="align",
-        num_speculative_blocks=2,
-    )
-    pool = BlockPool(num_gpu_blocks=16, enable_caching=False, hash_block_size=4)
-    manager = MambaManager(
-        spec,
-        block_pool=pool,
-        enable_caching=False,
-        kv_cache_group_id=0,
-        scheduler_block_size=4,
-    )
-    manager.set_spec_release_mode(True)
-    assert manager.release_spec_blocks("r") is False
-    assert "r" in manager._spec_released
-
-    manager.set_spec_release_mode(False)
-    assert manager.resume_spec_blocks("r") is False
-    assert "r" in manager._spec_released
-
-
-def test_mamba_k0_admission_reserves_window_as_nulls():
-    """A request admitted while the batch is at the K=0 tier gets its
+def test_mamba_tier0_admission_reserves_window_as_nulls():
+    """A request priced down to the K=0 tier at admission gets its
     speculative window as null row slots (no pool blocks): the row keeps
     the standard layout — skip nulls, committed, window — so the state
-    indexing formula holds from birth and the resume refills the
+    indexing formula holds from birth and the promotion refills the
     window."""
-    spec = MambaSpec(
-        block_size=4,
-        shapes=((1, 1),),
-        dtypes=(torch.float32,),
-        mamba_cache_mode="align",
-        num_speculative_blocks=2,
-    )
-    pool = BlockPool(num_gpu_blocks=16, enable_caching=False, hash_block_size=4)
-    manager = MambaManager(
-        spec,
-        block_pool=pool,
-        enable_caching=False,
-        kv_cache_group_id=0,
-        scheduler_block_size=4,
-    )
-    manager.set_spec_release_mode(True)
-    assert manager.release_spec_blocks("r") is False
+    manager, pool = _align_manager()
+    assert manager.mark_spec_admission_tier0("r") is True
+    assert manager.is_spec_released("r")
     free_before = pool.get_num_free_blocks()
 
     blocks = manager.allocate_new_blocks("r", num_tokens=8, num_tokens_main_model=8)
@@ -308,28 +154,32 @@ def test_mamba_k0_admission_reserves_window_as_nulls():
     assert "r" in manager._allocated_block_reqs
 
 
-def test_mamba_k0_growth_fills_window_nulls():
-    """Decoding at the K=0 tier advances the state boundary into the
-    released window: the null positions must be refilled in place (the
-    state chain needs real blocks there) while the row keeps growing one
-    slot per boundary crossing."""
-    spec = MambaSpec(
-        block_size=4,
-        shapes=((1, 1),),
-        dtypes=(torch.float32,),
-        mamba_cache_mode="align",
-        num_speculative_blocks=2,
-    )
-    pool = BlockPool(num_gpu_blocks=16, enable_caching=False, hash_block_size=4)
-    manager = MambaManager(
-        spec,
-        block_pool=pool,
-        enable_caching=False,
-        kv_cache_group_id=0,
-        scheduler_block_size=4,
-    )
-    manager.set_spec_release_mode(True)
-    assert manager.release_spec_blocks("r") is False
+def test_mamba_priced_admission_mark_guards():
+    """Only a fresh waiting request under a spec-decode align pool can be
+    priced down: the mark refuses pools without a speculative window,
+    non-align modes, and requests that already hold blocks."""
+    no_window, _ = _align_manager(num_spec_blocks=0)
+    assert no_window.mark_spec_admission_tier0("r") is False
+
+    non_align, _ = _align_manager(mode="none")
+    assert non_align.mark_spec_admission_tier0("r") is False
+
+    manager, pool = _align_manager()
+    assert manager.mark_spec_admission_tier0("r") is True
+    free_before = pool.get_num_free_blocks()
+    manager.allocate_new_blocks("r", num_tokens=8, num_tokens_main_model=8)
+    assert manager.spec_admission_priceable("r") is False
+    assert manager.is_spec_released("r")
+    assert pool.get_num_free_blocks() == free_before - 1
+
+
+def test_mamba_pinned_row_growth_fills_window_nulls():
+    """Decoding advances the state boundary into the pinned window: the
+    null positions must be refilled in place (the state chain needs real
+    blocks there) while the row keeps growing one slot per boundary
+    crossing."""
+    manager, pool = _align_manager()
+    assert manager.mark_spec_admission_tier0("r") is True
     manager.allocate_new_blocks("r", num_tokens=8, num_tokens_main_model=8)
     free_after_admission = pool.get_num_free_blocks()
 
@@ -348,51 +198,104 @@ def test_mamba_k0_growth_fills_window_nulls():
     assert pool.get_num_free_blocks() == free_after_admission - 4
 
 
-def test_mamba_k0_release_resume_cycle_pool_accounting():
-    """Release at the K=0 crossing, decode through it, resume on the way
-    up, release again: the pool must return the hedge blocks on every
-    release and the row must stay layout-consistent throughout."""
-    spec = MambaSpec(
-        block_size=4,
-        shapes=((1, 1),),
-        dtypes=(torch.float32,),
-        mamba_cache_mode="align",
-        num_speculative_blocks=2,
-    )
-    pool = BlockPool(num_gpu_blocks=16, enable_caching=False, hash_block_size=4)
-    manager = MambaManager(
-        spec,
-        block_pool=pool,
-        enable_caching=False,
-        kv_cache_group_id=0,
-        scheduler_block_size=4,
-    )
+def test_mamba_promotion_reallocates_fresh_blocks():
+    """The priced promotion refills the pinned window's null positions
+    with fresh hedge blocks: they are empty allocations, not computed
+    data, so no replay is needed and the allocate path counts the row as
+    a normal full-window row afterwards."""
+    manager, pool = _align_manager()
+    assert manager.mark_spec_admission_tier0("r") is True
     manager.allocate_new_blocks("r", num_tokens=8, num_tokens_main_model=8)
     row = manager.req_to_blocks["r"]
-    assert all(block.ref_cnt == 1 for block in row[1:])
-    free_normal = pool.get_num_free_blocks()
-
-    manager.set_spec_release_mode(True)
-    assert manager.release_spec_blocks("r") is True
     assert row[2:] == [pool.null_block, pool.null_block]
-    assert pool.get_num_free_blocks() == free_normal + 2
+    free_pinned = pool.get_num_free_blocks()
+
+    assert manager.promote_spec_blocks("r") is True
+    fresh = row[2:]
+    assert len(fresh) == 2
+    assert all(block.ref_cnt == 1 for block in fresh)
+    assert pool.get_num_free_blocks() == free_pinned - 2
+    assert not manager.is_spec_released("r")
     assert manager.take_spec_row_rebuilds() == {"r"}
+    assert manager.promote_spec_blocks("r") is False
 
-    manager.allocate_new_blocks("r", num_tokens=12, num_tokens_main_model=12)
-    assert len(row) == 5
-    assert all(block.ref_cnt == 1 for block in row[1:])
+    assert (
+        manager.get_num_blocks_to_allocate(
+            request_id="r",
+            num_tokens=8,
+            new_computed_blocks=[],
+            total_computed_tokens=8,
+            num_local_computed_tokens=8,
+            num_tokens_main_model=8,
+        )
+        == 0
+    )
 
-    manager.set_spec_release_mode(False)
-    assert manager.resume_spec_blocks("r") is False
-    assert "r" not in manager._spec_released
 
-    assert manager.release_spec_blocks("r") is True
-    assert row[3:] == [pool.null_block, pool.null_block]
-    assert pool.get_num_free_blocks() == free_normal + 1
+def test_mamba_promotion_prices_against_free_blocks():
+    """The promotion is priced: it refills only when the pool fits the
+    window (plus the reserve); a refused promotion leaves the row and
+    the pin untouched."""
+    manager, pool = _align_manager(num_gpu_blocks=8)
+    assert manager.mark_spec_admission_tier0("r") is True
+    manager.allocate_new_blocks("r", num_tokens=8, num_tokens_main_model=8)
+    free_pinned = pool.get_num_free_blocks()
+    row = list(manager.req_to_blocks["r"])
 
-    assert manager.resume_spec_blocks("r") is True
-    assert all(block.ref_cnt == 1 for block in row[1:])
-    assert manager.take_spec_row_rebuilds() == {"r"}
+    assert manager.promote_spec_blocks("r", reserve=free_pinned - 1) is False
+    assert manager.req_to_blocks["r"] == row
+    assert manager.is_spec_released("r")
+    assert pool.get_num_free_blocks() == free_pinned
+
+    assert manager.promote_spec_blocks("r", reserve=free_pinned - 2) is True
+    assert all(block.ref_cnt == 1 for block in manager.req_to_blocks["r"][2:])
+    assert not manager.is_spec_released("r")
+
+
+def test_mamba_promotion_never_replaces_committed_tail():
+    """A row whose window positions are committed blocks (the boundary
+    consumed them) has nothing to refill: the promotion must touch
+    nothing and just clear the stale pin — the blind tail replacement
+    destroyed committed state and left the request unmarked with no
+    hedge, which crashed the relocation loop with negative indices
+    ("must be exclusively owned and unhashed")."""
+    manager, pool = _align_manager()
+    committed = pool.get_new_blocks(3)
+    manager.req_to_blocks["r"] = list(committed)
+    manager._allocated_block_reqs.add("r")
+    manager._spec_released.add("r")
+    free_before = pool.get_num_free_blocks()
+
+    assert manager.promote_spec_blocks("r") is False
+    assert manager.req_to_blocks["r"] == committed
+    assert pool.get_num_free_blocks() == free_before
+    assert not manager.is_spec_released("r")
+
+
+def test_mamba_promotion_keeps_pin_when_row_missing():
+    """The admission mark pins row-less requests at the K=0 tier. The
+    promotion must not clear that pin before hedge blocks are actually
+    placed — an unpinned hedge-less row is what walked the relocation
+    loop off the end of the row in the first rig crash."""
+    manager, _ = _align_manager()
+    assert manager.mark_spec_admission_tier0("r") is True
+    assert manager.is_spec_released("r")
+
+    assert manager.promote_spec_blocks("r") is False
+    assert manager.is_spec_released("r")
+
+
+def test_mamba_pin_cleared_on_free():
+    """The pin dies with the row: a freed request must not leave its
+    K=0 mark behind, or a later admission would silently inherit the
+    tier-0 window substitution."""
+    manager, _ = _align_manager()
+    assert manager.mark_spec_admission_tier0("r") is True
+    manager.allocate_new_blocks("r", num_tokens=8, num_tokens_main_model=8)
+    assert manager.is_spec_released("r")
+
+    manager.free("r")
+    assert not manager.is_spec_released("r")
 
 
 def test_mamba_retirement_crosses_null_gaps():

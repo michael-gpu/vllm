@@ -55,7 +55,7 @@ from vllm.v1.core.sched.diffusion_scheduler import (
 )
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler, _k0_release_with_dwell
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
 from vllm.v1.engine.core import EngineCore
@@ -8797,33 +8797,136 @@ def test_cpu_encoder_input_updates_preserve_shm_handles(use_v2_model_runner):
     assert request.mm_features[0].data is handle
 
 
-def test_k0_release_dwell_arms_only_after_consecutive_k0_steps():
-    # The boundary hover (K=0/K=1 oscillation) must never arm the release:
-    # each K>0 step resets the dwell, so the pool never flaps.
-    dwell = 8
-    count = 0
-    for predicted_k in [0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0]:
-        release, count = _k0_release_with_dwell(predicted_k, count, dwell)
-        assert release is False
-    assert count == 1
+def _mamba_priced_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    num_blocks: int,
+    schedule_table: list[tuple[int, int, int]],
+):
+    """A mamba-align scheduler with a dynamic spec-tier table and a tight
+    state pool, for the pool-priced admission tests."""
+    monkeypatch.setenv("VLLM_MAMBA_PRICED_ADMISSION", "1")
+    return create_scheduler(
+        max_num_seqs=16,
+        num_blocks=num_blocks,
+        block_size=16,
+        num_speculative_tokens=2,
+        num_speculative_tokens_per_batch_size=schedule_table,
+        kv_cache_spec=MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            num_speculative_blocks=2,
+        ),
+    )
 
-    # A steady K=0 batch arms the release exactly at the dwell step.
-    count = 0
-    for step in range(1, dwell):
-        release, count = _k0_release_with_dwell(0, count, dwell)
-        assert release is False
-    release, count = _k0_release_with_dwell(0, count, dwell)
-    assert release is True
-    # It stays armed while the batch remains at K=0.
-    release, count = _k0_release_with_dwell(0, count, dwell)
-    assert release is True
 
-    # The resume is immediate: one K>0 step disarms and resets the dwell.
-    release, count = _k0_release_with_dwell(1, count, dwell)
-    assert release is False
-    assert count == 0
+def test_priced_admission_degrades_to_k0_before_stalling(monkeypatch):
+    """Pool-priced admission: a request whose scheduled-tier footprint does
+    not fit admits at the K=0 tier (window as null row slots, pinned)
+    instead of stalling the admission; a request that cannot fit even at
+    the K=0 tier stalls with the pin cleared."""
+    scheduler = _mamba_priced_scheduler(
+        monkeypatch, num_blocks=5, schedule_table=[(1, 4, 2), (5, 16, 1), (17, 128, 0)]
+    )
+    kv_cache_manager = scheduler.kv_cache_manager
+    req_a, req_b, req_c = create_requests(
+        num_requests=3, num_tokens=32, max_tokens=4, block_size=16
+    )
+    for req in (req_a, req_b, req_c):
+        scheduler.add_request(req)
 
-    # dwell=1 recovers the undamped per-crossing release.
-    release, count = _k0_release_with_dwell(0, 0, 1)
-    assert release is True
-    assert count == 1
+    output = scheduler.schedule()
+
+    # req_a admits at the scheduled tier (K=2, full window); req_b's full
+    # footprint does not fit and is priced down to the K=0 tier; req_c
+    # cannot fit at any tier and stalls with no pin left behind.
+    assert set(output.num_scheduled_tokens) == {req_a.request_id, req_b.request_id}
+    assert not kv_cache_manager.is_spec_released(req_a.request_id)
+    assert kv_cache_manager.is_spec_released(req_b.request_id)
+    row_a = kv_cache_manager.coordinator.single_type_managers[0].req_to_blocks[
+        req_a.request_id
+    ]
+    row_b = kv_cache_manager.coordinator.single_type_managers[0].req_to_blocks[
+        req_b.request_id
+    ]
+    assert all(block.ref_cnt == 1 for block in row_a[1:])
+    assert row_b[2:] == [kv_cache_manager.block_pool.null_block] * 2
+    assert not kv_cache_manager.is_spec_released(req_c.request_id)
+
+
+def test_priced_admission_pin_gates_promotion(monkeypatch):
+    """A row pinned at the K=0 tier is promoted only when the count-based
+    table schedules K>0 AND the refill fits the pool: the pin — not the
+    count — holds the tier down, and the promotion is priced, not
+    count-driven."""
+    scheduler = _mamba_priced_scheduler(
+        monkeypatch, num_blocks=8, schedule_table=[(1, 4, 2), (5, 16, 1), (17, 128, 0)]
+    )
+    kv_cache_manager = scheduler.kv_cache_manager
+    mamba_manager = kv_cache_manager.coordinator.single_type_managers[0]
+    (req_a,) = create_requests(
+        num_requests=1, num_tokens=33, max_tokens=1, block_size=16, req_ids=["a"]
+    )
+    (req_p,) = create_requests(
+        num_requests=1, num_tokens=33, max_tokens=4, block_size=16, req_ids=["p"]
+    )
+    (req_b,) = create_requests(
+        num_requests=1, num_tokens=33, max_tokens=4, block_size=16, req_ids=["b"]
+    )
+    for req in (req_a, req_p, req_b):
+        scheduler.add_request(req)
+
+    output = scheduler.schedule()
+    # The pool is tight when req_b arrives: its full-tier footprint does
+    # not fit and it is admitted pinned at the K=0 tier.
+    assert not kv_cache_manager.is_spec_released(req_a.request_id)
+    assert not kv_cache_manager.is_spec_released(req_p.request_id)
+    assert kv_cache_manager.is_spec_released(req_b.request_id)
+    _model_output(scheduler, output, [[100], [100], [100]])
+    scheduler.update_draft_token_ids(DraftTokenIds([req_b.request_id], [[1, 2]]))
+
+    # req_a finishes and returns its blocks; the table still schedules
+    # K>0 at the remaining batch, and the refill now fits: the pinned row
+    # is promoted and its runner row is routed through the resumed
+    # channel.
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[req_b.request_id] == 1
+    assert req_b.request_id not in output.scheduled_spec_decode_tokens
+    assert not kv_cache_manager.is_spec_released(req_b.request_id)
+    assert all(
+        block.ref_cnt == 1
+        for block in mamba_manager.req_to_blocks[req_b.request_id][2:]
+    )
+    assert req_b.request_id in output.scheduled_cached_reqs.resumed_req_ids
+
+
+def test_priced_admission_no_promotion_while_table_schedules_k0(monkeypatch):
+    """While the count-based table schedules K=0, a pinned row stays
+    pinned even when the pool could afford the refill: the table is the
+    prior and the promotion follows it, not the free pool alone."""
+    scheduler = _mamba_priced_scheduler(
+        monkeypatch, num_blocks=12, schedule_table=[(1, 1, 2), (2, 16, 0)]
+    )
+    kv_cache_manager = scheduler.kv_cache_manager
+    req_a, req_b = create_requests(
+        num_requests=2, num_tokens=32, max_tokens=4, block_size=16
+    )
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+
+    output = scheduler.schedule()
+    # req_a admits at the scheduled tier (K=2 at count 1); req_b's prior
+    # is already K=0 at count 2, so it is born pinned at the K=0 tier.
+    assert not kv_cache_manager.is_spec_released(req_a.request_id)
+    assert kv_cache_manager.is_spec_released(req_b.request_id)
+    _model_output(scheduler, output, [[100], [100]])
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[req_a.request_id] == 1
+    assert output.num_scheduled_tokens[req_b.request_id] == 1
+    assert (
+        req_a.request_id not in output.scheduled_spec_decode_tokens
+        and req_b.request_id not in output.scheduled_spec_decode_tokens
+    )
+    assert kv_cache_manager.is_spec_released(req_b.request_id)

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -203,9 +203,6 @@ class KVCacheManager:
             if manager.retains_longer_hit
         )
         self.kv_cache_config = kv_cache_config
-        # K=0 slot release: per-step mode (True while the adaptive batch is
-        # at the K=0 tier) + the runner-row rebuilds collected this step.
-        self._spec_release_mode = False
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -423,6 +420,7 @@ class KVCacheManager:
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
         skip_zeroing_group_ids: tuple[int, ...] = (),
+        count_failure: bool = True,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -448,6 +446,10 @@ class KVCacheManager:
                 free blocks to hold the full sequence, accounting for prefix cache hits
                 and sliding window. Used as an admission gate to prevent over-admitting
                 requests when chunked prefill would otherwise only check the first chunk
+            count_failure: Whether a failed admission is recorded in the
+                admission-failure log. The priced-admission retry passes False
+                on its first attempt: a failure at the scheduled tier that
+                then admits at a cheaper tier is not a stall.
             reserved_blocks: Number of free blocks that must be left available for
                 other in-flight sequences to complete. The actual allocation is only
                 made if it fits within (free blocks - reserved_blocks). Used to gate
@@ -522,14 +524,6 @@ class KVCacheManager:
                 "computed tokens to adopt"
             )
 
-        # K=0 tier: the per-draft-token mamba state blocks are idle hedges
-        # — release them back to the pool (the positions stay, held by
-        # null blocks). The resume un-swap rides allocate_new_blocks.
-        if self._spec_release_mode:
-            for manager in self.coordinator.single_type_managers:
-                if isinstance(manager, MambaManager):
-                    manager.release_spec_blocks(request.request_id)
-
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
             if self.retained_hit_group_ids:
@@ -585,13 +579,14 @@ class KVCacheManager:
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
-                self._log_admission_failure(
-                    request,
-                    num_blocks_to_allocate,
-                    watermark_blocks,
-                    reserved_blocks,
-                    full_fit=True,
-                )
+                if count_failure:
+                    self._log_admission_failure(
+                        request,
+                        num_blocks_to_allocate,
+                        watermark_blocks,
+                        reserved_blocks,
+                        full_fit=True,
+                    )
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -631,13 +626,14 @@ class KVCacheManager:
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
-            self._log_admission_failure(
-                request,
-                num_blocks_to_allocate,
-                watermark_blocks,
-                reserved_blocks,
-                full_fit=False,
-            )
+            if count_failure:
+                self._log_admission_failure(
+                    request,
+                    num_blocks_to_allocate,
+                    watermark_blocks,
+                    reserved_blocks,
+                    full_fit=False,
+                )
             # Cannot allocate new blocks
             return None
 
@@ -711,13 +707,6 @@ class KVCacheManager:
             request_id, processed_computed_tokens, num_prompt_tokens
         )
 
-    def set_spec_release_mode(self, active: bool) -> None:
-        """Per-step: True while the adaptive batch is at the K=0 tier."""
-        self._spec_release_mode = active
-        for manager in self.coordinator.single_type_managers:
-            if isinstance(manager, MambaManager):
-                manager.set_spec_release_mode(active)
-
     def take_spec_row_rebuilds(self) -> set[str]:
         """The request ids whose runner rows must be rebuilt this step."""
         rebuilds: set[str] = set()
@@ -726,35 +715,51 @@ class KVCacheManager:
                 rebuilds |= manager.take_spec_row_rebuilds()
         return rebuilds
 
-    def release_spec_blocks(self, request_ids: Iterable[str]) -> set[str]:
-        """Free the per-draft-token mamba state blocks (the K=0 tier).
+    def spec_admission_priceable(self, request_id: str) -> bool:
+        """Whether the request's admission can be priced down to the K=0
+        spec tier (any mamba group can hold it as a null window)."""
+        return any(
+            manager.spec_admission_priceable(request_id)
+            for manager in self.coordinator.single_type_managers
+            if isinstance(manager, MambaManager)
+        )
 
-        The idle hedge slots return to the pool; positions are held by
-        null blocks so the worker's state indexing is unchanged. Returns
-        the ids whose runner rows must be rebuilt (blocks were freed).
-        """
-        released: set[str] = set()
+    def mark_spec_admission_tier0(self, request_id: str) -> bool:
+        """Mark a waiting request for a K=0-tier admission: its speculative
+        window is born as null row slots. Returns False when no mamba
+        group can price the admission."""
+        marked = False
         for manager in self.coordinator.single_type_managers:
             if isinstance(manager, MambaManager):
-                for request_id in request_ids:
-                    if manager.release_spec_blocks(request_id):
-                        released.add(request_id)
-        return released
+                marked = manager.mark_spec_admission_tier0(request_id) or marked
+        return marked
 
-    def resume_spec_blocks(self, request_ids: Iterable[str]) -> set[str]:
-        """Re-allocate fresh speculative state blocks (the K>0 resume).
-
-        The hedge slots are empty allocations, not computed data, so
-        fresh blocks are correct without any replay. Returns the ids
-        whose runner rows must be rebuilt (the spec positions changed).
-        """
-        resumed: set[str] = set()
+    def unmark_spec_admission(self, request_id: str) -> None:
         for manager in self.coordinator.single_type_managers:
             if isinstance(manager, MambaManager):
-                for request_id in request_ids:
-                    if manager.resume_spec_blocks(request_id):
-                        resumed.add(request_id)
-        return resumed
+                manager.unmark_spec_admission(request_id)
+
+    def is_spec_released(self, request_id: str) -> bool:
+        """Whether the request is pinned at the K=0 spec tier."""
+        return any(
+            manager.is_spec_released(request_id)
+            for manager in self.coordinator.single_type_managers
+            if isinstance(manager, MambaManager)
+        )
+
+    def promote_spec_blocks(self, request_id: str, reserve: int = 0) -> bool:
+        """Price and run the pinned row's promotion to the full spec tier.
+
+        Refills the window's null positions only when the pool fits them
+        (plus `reserve`); otherwise the row stays pinned. Returns True
+        when any mamba group promoted the row (its runner row is marked
+        for rebuild and must be routed through the resumed channel).
+        """
+        promoted = False
+        for manager in self.coordinator.single_type_managers:
+            if isinstance(manager, MambaManager):
+                promoted = manager.promote_spec_blocks(request_id, reserve) or promoted
+        return promoted
 
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping and return its blocks without
