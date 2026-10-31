@@ -8822,35 +8822,46 @@ def _mamba_priced_scheduler(
 
 
 def test_priced_admission_degrades_to_k0_before_stalling(monkeypatch):
-    """Pool-priced admission, batch-aware prior: when the forming batch
-    cannot hold the full spec window for its rows, the head rows admit at
-    the K=0 tier (window as null row slots, pinned) instead of eating the
-    pool the tail needs; a request that cannot fit even at the K=0 tier
-    stalls with the pin cleared."""
+    """Formed-batch uniform tier, the projection-error net: when the
+    step-level check found a fitting tier, a row whose own footprint
+    fails at that tier (the running rows' growth ate the margin) retries
+    at the K=0 tier and admits pinned instead of stalling. When NO tier
+    fit (the bottom-out), the same failure stalls — see
+    test_uniform_tier_bottom_out_refuses_retry."""
     scheduler = _mamba_priced_scheduler(
-        monkeypatch, num_blocks=3, schedule_table=[(1, 4, 2), (5, 16, 1), (17, 128, 0)]
+        monkeypatch, num_blocks=10, schedule_table=[(1, 128, 2)]
     )
     kv_cache_manager = scheduler.kv_cache_manager
-    reqs = create_requests(num_requests=4, num_tokens=16, max_tokens=4, block_size=16)
-    for req in reqs:
-        scheduler.add_request(req)
-
-    output = scheduler.schedule()
-
-    # The forming batch of 4 cannot hold 4 full windows in a 3-block pool:
-    # the head rows admit pinned at the K=0 tier until the pool is
-    # exhausted; the tail cannot fit even at the K=0 tier and stalls with
-    # no pin left behind.
-    scheduled = set(output.num_scheduled_tokens)
-    assert scheduled == {req.request_id for req in reqs[:2]}
-    assert not any(
-        kv_cache_manager.is_spec_released(req.request_id) for req in reqs[2:]
-    )
     mamba_manager = kv_cache_manager.coordinator.single_type_managers[0]
-    for req in reqs[:2]:
-        assert kv_cache_manager.is_spec_released(req.request_id)
-        row = mamba_manager.req_to_blocks[req.request_id]
-        assert row[-2:] == [kv_cache_manager.block_pool.null_block] * 2
+    (req_a,) = create_requests(
+        num_requests=1, num_tokens=16, max_tokens=4, block_size=16, req_ids=["a"]
+    )
+    req_b, req_c = create_requests(
+        num_requests=2, num_tokens=16, max_tokens=4, block_size=16, req_ids=["b", "c"]
+    )
+    scheduler.add_request(req_a)
+    output = scheduler.schedule()
+    # req_a admits alone at the table's K=2 tier (3 blocks fit easily).
+    assert not kv_cache_manager.is_spec_released(req_a.request_id)
+    _model_output(scheduler, output, [[100]])
+
+    for req in (req_b, req_c):
+        scheduler.add_request(req)
+    output = scheduler.schedule()
+    # The step check passes at K=2 (2 waiting rows x 3 = 6 <= 6 free),
+    # but req_a's decode growth consumes a block first: req_b admits at
+    # K=2, req_c's K=2 footprint fails and the retry admits it pinned at
+    # the K=0 tier — the net for the projection error, not a stall.
+    assert set(output.num_scheduled_tokens) == {
+        req.request_id for req in (req_a, req_b, req_c)
+    }
+    assert output.num_spec_tokens_to_schedule == 2
+    assert not kv_cache_manager.is_spec_released(req_a.request_id)
+    assert not kv_cache_manager.is_spec_released(req_b.request_id)
+    assert kv_cache_manager.is_spec_released(req_c.request_id)
+    assert req_c.request_id in mamba_manager.req_to_blocks
+    row = mamba_manager.req_to_blocks[req_c.request_id]
+    assert row[-2:] == [kv_cache_manager.block_pool.null_block] * 2
 
 
 def test_priced_admission_pin_gates_promotion(monkeypatch):
@@ -9077,6 +9088,33 @@ def test_uniform_tier_attention_bound_no_demotion(monkeypatch):
     # admit tier-loyally while they fit and the tail queues — the old
     # stall behavior, with no rows demoted behind the scheduler's back.
     assert set(output.num_scheduled_tokens) == {req.request_id for req in reqs[:7]}
+    assert output.num_spec_tokens_to_schedule == 2
+    for req in reqs:
+        assert not kv_cache_manager.is_spec_released(req.request_id)
+
+
+def test_uniform_tier_bottom_out_refuses_retry(monkeypatch):
+    """When no tier fits the formed batch (the bottom-out), the per-row
+    priced retry is gated off: a row the table tier cannot hold STALLS
+    instead of admitting at the K=0 tier. The ungated retry over-admits
+    rows past the all-pool verdict — the 68K c14 engine kill (the
+    attention growth of retry-admitted rows exhausted the pool the
+    tier-loyal stall would have protected)."""
+    scheduler = _mamba_priced_scheduler(
+        monkeypatch, num_blocks=6, schedule_table=[(1, 128, 2)]
+    )
+    kv_cache_manager = scheduler.kv_cache_manager
+    reqs = create_requests(num_requests=6, num_tokens=16, max_tokens=4, block_size=16)
+    for req in reqs:
+        scheduler.add_request(req)
+
+    output = scheduler.schedule()
+
+    # 6 rows need 18 blocks at K>0 and 6 at K=0 against 5 free: no tier
+    # fits, the table tier (K=2) stands. The head row admits tier-loyally;
+    # the next row's K=2 footprint fails and its K=0 footprint WOULD fit
+    # the leftover — the gated retry refuses it and the admission stalls.
+    assert set(output.num_scheduled_tokens) == {reqs[0].request_id}
     assert output.num_spec_tokens_to_schedule == 2
     for req in reqs:
         assert not kv_cache_manager.is_spec_released(req.request_id)
