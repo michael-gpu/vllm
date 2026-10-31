@@ -828,6 +828,7 @@ class Scheduler(SchedulerInterface):
         # stalls (tier-loyal — the old behavior).
         spec_tier_lookup = self.dynamic_sd_lookup
         step_tier = 0
+        spec_tier_fits = False
         formed_waiting: list[Request] = []
         if self._priced_admission and spec_tier_lookup is not None:
             formed_count = min(
@@ -844,13 +845,16 @@ class Scheduler(SchedulerInterface):
                 formed_waiting, step_tier
             ):
                 step_tier -= 1
-            if (
-                step_tier == 0
-                and table_tier > 0
-                and not self.kv_cache_manager.spec_batch_fits_tier(formed_waiting, 0)
+            if step_tier > 0 or self.kv_cache_manager.spec_batch_fits_tier(
+                formed_waiting, 0
             ):
+                spec_tier_fits = True
+            elif table_tier > 0:
                 # No tier fits the formed batch: the table tier stands and
-                # admission stalls (tier-loyal — the old behavior).
+                # admission stalls (tier-loyal — the old behavior). The
+                # per-row retry is gated off below: admitting rows that a
+                # fitting tier refused is the over-admission the all-pool
+                # check exists to prevent (the 68K c14 engine kill).
                 step_tier = table_tier
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -1555,13 +1559,17 @@ class Scheduler(SchedulerInterface):
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                     # A failure at the scheduled tier is not a stall when
-                    # the priced retry below can still admit the request.
-                    count_failure=not (priceable and prior_tier > 0),
+                    # the step-level check found a fitting tier — the
+                    # priced retry below can then still admit the request
+                    # safely (a batch that fits at tier T fits at K=0).
+                    # When no tier fit (the bottom-out), the failure IS
+                    # the tier-loyal stall.
+                    count_failure=not (priceable and prior_tier > 0 and spec_tier_fits),
                 )
 
                 if new_blocks is None and priceable:
                     self.kv_cache_manager.unmark_spec_admission(request_id)
-                    if prior_tier > 0:
+                    if prior_tier > 0 and spec_tier_fits:
                         # The scheduled tier's footprint does not fit:
                         # retry at the K=0 tier and pin the request there
                         # instead of stalling the admission.
