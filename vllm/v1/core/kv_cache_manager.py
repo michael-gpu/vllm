@@ -742,20 +742,36 @@ class KVCacheManager:
             if isinstance(manager, MambaManager):
                 manager.unmark_spec_admission(request_id)
 
+    def _request_end_num_tokens(self, request: Request) -> int:
+        """Upper bound on the request's final total token count: the prompt
+        plus its generation cap, bounded by the model length."""
+        sampling_params = request.sampling_params
+        max_gen = sampling_params.max_tokens if sampling_params is not None else None
+        end = request.num_prompt_tokens + (
+            max_gen if max_gen is not None else self.max_model_len
+        )
+        return min(end, self.max_model_len)
+
     def spec_batch_fits_tier(
         self, requests: list[Request], tier: int, reserved_blocks: int = 0
     ) -> bool:
         """Whole-batch fit check for the formed-batch uniform-tier rule:
-        whether every not-yet-allocated request in `requests` can hold its
-        end-state footprint at the given spec tier simultaneously, plus
-        the admission watermark, in every constrained pool. Managers
-        sharing one block pool are priced against it together."""
+        whether the formed batch can hold every row's end-state footprint
+        at the given spec tier simultaneously, plus the admission
+        watermark, in every constrained pool. Rows not yet allocated
+        reserve their full end state; allocated rows (running or
+        kv-holding) reserve the remaining growth to it — their held
+        blocks are already outside the free count, and the growth is the
+        chunk-allocation demand the running loop will make on the pool
+        (the 68K c14 engine kill when unreserved). Managers sharing one
+        block pool are priced against it together."""
         pools: dict[int, list[SingleTypeKVCacheManager]] = {}
         for manager in self.coordinator.single_type_managers:
             pools.setdefault(id(manager.block_pool), []).append(manager)
+        end_tokens = [self._request_end_num_tokens(request) for request in requests]
         for pool_managers in pools.values():
             need = sum(
-                manager.spec_batch_tier_need(requests, tier)
+                manager.spec_batch_tier_need(requests, tier, end_tokens)
                 for manager in pool_managers
             )
             if need == 0:

@@ -265,24 +265,32 @@ class SingleTypeKVCacheManager(ABC):
             num_new_blocks += 1
         return num_new_blocks + num_evictable_blocks
 
-    def spec_batch_tier_need(self, requests: list[Request], tier: int) -> int:
-        """End-state block need summed over the not-yet-allocated requests
-        (the formed-batch fit projection). Tier-independent for groups
-        without speculative state; the mamba align manager overrides with
-        the tier-dependent window term. Prefix-hit-blind: it reserves the
-        full row for every request, which can only over-price an
-        admission."""
+    def spec_batch_tier_need(
+        self, requests: list[Request], tier: int, end_tokens: list[int]
+    ) -> int:
+        """End-state block need summed over the formed batch (the
+        formed-batch fit projection). Rows not yet allocated reserve
+        their full end state; allocated rows reserve the remaining
+        growth to it. Tier-independent for groups without speculative
+        state; the mamba align manager overrides with the tier-dependent
+        window term. Prefix-hit-blind: it reserves the full row for every
+        request, which can only over-price an admission."""
         del tier
         need = 0
-        for request in requests:
-            if request.request_id in self.req_to_blocks:
-                continue
-            num_required_blocks = cdiv(request.num_tokens, self.block_size)
+        for request, end in zip(requests, end_tokens):
+            end_blocks = cdiv(end, self.block_size)
             if self.max_admission_blocks_per_request is not None:
-                num_required_blocks = min(
-                    num_required_blocks, self.max_admission_blocks_per_request
-                )
-            need += num_required_blocks
+                end_blocks = min(end_blocks, self.max_admission_blocks_per_request)
+            blocks = self.req_to_blocks.get(request.request_id)
+            if blocks is None:
+                need += end_blocks
+                continue
+            held = len(blocks)
+            if self.max_admission_blocks_per_request is not None:
+                # Capped specs (SWA, chunked-local) pad skipped positions
+                # with nulls; only their rows are short enough to scan.
+                held -= sum(1 for block in blocks if block.is_null)
+            need += max(end_blocks - held, 0)
         return need
 
     def add_local_computed_blocks(
@@ -2063,25 +2071,38 @@ class MambaManager(SingleTypeKVCacheManager):
         tier: a fresh waiting request under a spec-decode align pool."""
         return self._spec_admission_priceable(request_id)
 
-    def spec_batch_tier_need(self, requests: list[Request], tier: int) -> int:
-        """End-state mamba row need at the given spec tier, summed over the
-        not-yet-allocated requests (the formed-batch fit projection).
+    def spec_batch_tier_need(
+        self, requests: list[Request], tier: int, end_tokens: list[int]
+    ) -> int:
+        """End-state mamba row need summed over the formed batch (the
+        formed-batch fit projection).
 
         The projection is prefix-hit-blind: it reserves the full row for
         every request, which can only over-price an admission — the
-        per-row priced retry stays the net for the opposite error. At the
-        K=0 tier the window is null row slots (no pool blocks); at any
-        K>0 tier the full physical window is reserved.
+        per-row priced retry stays the net for the opposite error. The
+        row's end length is tier-independent (cdiv(end_tokens) plus the
+        window); the tier only decides physical hedge blocks versus null
+        row slots. Rows not yet allocated reserve the full end state
+        (minus the window at the K=0 tier, where it is born null);
+        allocated rows reserve the remaining growth to it — for a pinned
+        row the held count is credited by the window because its null
+        positions refill from the pool as the boundary advances (at most
+        the window's worth, the same term promotion refills).
         """
         if self.num_speculative_blocks <= 0 or self.mamba_cache_mode != "align":
             return 0
+        window = self.num_speculative_blocks
         need = 0
-        for request in requests:
-            if request.request_id in self._allocated_block_reqs:
+        for request, end in zip(requests, end_tokens):
+            end_blocks = cdiv(end, self.block_size) + window
+            blocks = self.req_to_blocks.get(request.request_id)
+            if blocks is None:
+                need += end_blocks if tier > 0 else end_blocks - window
                 continue
-            need += cdiv(request.num_tokens, self.block_size)
-            if tier > 0:
-                need += self.num_speculative_blocks
+            held = len(blocks)
+            if request.request_id in self._spec_released:
+                held -= window
+            need += max(end_blocks - held, 0)
         return need
 
     def mark_spec_admission_tier0(self, request_id: str) -> bool:

@@ -829,24 +829,28 @@ class Scheduler(SchedulerInterface):
         spec_tier_lookup = self.dynamic_sd_lookup
         step_tier = 0
         spec_tier_fits = False
-        formed_waiting: list[Request] = []
+        formed_batch: list[Request] = []
         if self._priced_admission and spec_tier_lookup is not None:
-            formed_count = min(
-                len(self.running) + len(self.kv_holding_waiting) + len(self.waiting),
-                len(spec_tier_lookup) - 1,
-            )
-            table_tier = spec_tier_lookup[formed_count]
-            step_tier = table_tier
             batch_slots = max(self.scheduler_config.max_num_seqs - len(self.running), 0)
             formed_waiting = (list(self.kv_holding_waiting) + list(self.waiting))[
                 :batch_slots
             ]
+            formed_batch = list(self.running) + formed_waiting
+            # The count schedule indexes the table by the batch being
+            # FORMED this step (running + the waiting rows that can
+            # actually join it), not by the whole waiting queue: during
+            # the bottom-out grind a stalled queue would otherwise drag
+            # the running rows' tier below the table's answer for the
+            # batch actually scheduled.
+            formed_count = min(len(formed_batch), len(spec_tier_lookup) - 1)
+            table_tier = spec_tier_lookup[formed_count]
+            step_tier = table_tier
             while step_tier > 0 and not self.kv_cache_manager.spec_batch_fits_tier(
-                formed_waiting, step_tier
+                formed_batch, step_tier
             ):
                 step_tier -= 1
             if step_tier > 0 or self.kv_cache_manager.spec_batch_fits_tier(
-                formed_waiting, 0
+                formed_batch, 0
             ):
                 spec_tier_fits = True
             elif table_tier > 0:
@@ -1086,10 +1090,13 @@ class Scheduler(SchedulerInterface):
             # watermark). The tier — not a per-request pin — governs the
             # step; the price — not the count — lifts the row. Only
             # decode-phase rows promote: the window is idle draft state
-            # until the row decodes.
+            # until the row decodes. Gated on the step-level verdict like
+            # the retry: at the bottom-out the refill would consume blocks
+            # the all-pool check refused to promise.
             if (
                 self._priced_admission
                 and step_tier > 0
+                and spec_tier_fits
                 and not (request.is_prefill_chunk)
             ):
                 self.kv_cache_manager.promote_spec_blocks(
@@ -1538,6 +1545,21 @@ class Scheduler(SchedulerInterface):
                     priceable = self.kv_cache_manager.spec_admission_priceable(
                         request_id
                     )
+                    if (
+                        not spec_tier_fits
+                        and not self.kv_cache_manager.spec_batch_fits_tier(
+                            [*self.running, request], prior_tier
+                        )
+                    ):
+                        # The bottom-out's tier-loyal admission prices the
+                        # row's END-STATE footprint against the free pool
+                        # MINUS the running rows' remaining growth (their
+                        # chunk-allocation demand comes first): a row
+                        # admitted past the all-pool verdict grows into
+                        # blocks the check refused to promise — the
+                        # long-generation engine kill. The row stalls
+                        # until completions free the pool.
+                        break
                     if priceable and prior_tier == 0:
                         self.kv_cache_manager.mark_spec_admission_tier0(request_id)
 

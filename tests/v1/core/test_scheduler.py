@@ -8822,12 +8822,14 @@ def _mamba_priced_scheduler(
 
 
 def test_priced_admission_degrades_to_k0_before_stalling(monkeypatch):
-    """Formed-batch uniform tier, the projection-error net: when the
-    step-level check found a fitting tier, a row whose own footprint
-    fails at that tier (the running rows' growth ate the margin) retries
-    at the K=0 tier and admits pinned instead of stalling. When NO tier
-    fit (the bottom-out), the same failure stalls — see
-    test_uniform_tier_bottom_out_refuses_retry."""
+    """Formed-batch uniform tier, the margin pressure shape: the running
+    row's remaining growth plus the waiting rows' end-states do not fit
+    at the table's K>0 tier, so the step degrades to the K=0 tier and
+    the whole batch admits pinned — the sound projection prices the
+    margin before any row is admitted, instead of admitting K>0 rows
+    and degrading one through the retry net (the net stays gated for
+    the bottom-out refusal, see
+    test_uniform_tier_bottom_out_refuses_retry)."""
     scheduler = _mamba_priced_scheduler(
         monkeypatch, num_blocks=10, schedule_table=[(1, 128, 2)]
     )
@@ -8848,16 +8850,17 @@ def test_priced_admission_degrades_to_k0_before_stalling(monkeypatch):
     for req in (req_b, req_c):
         scheduler.add_request(req)
     output = scheduler.schedule()
-    # The step check passes at K=2 (2 waiting rows x 3 = 6 <= 6 free),
-    # but req_a's decode growth consumes a block first: req_b admits at
-    # K=2, req_c's K=2 footprint fails and the retry admits it pinned at
-    # the K=0 tier — the net for the projection error, not a stall.
+    # The end-state projection (req_a's remaining growth 1 + 2 waiting
+    # rows x 4 = 9) exceeds the 6 free at K=2 and K=1; at K=0 it fits
+    # (2 x 2 + 1 = 5): the step degrades to K=0 and the whole batch
+    # admits pinned — no row is admitted at a tier the margin cannot
+    # hold, so no per-row retry is needed.
     assert set(output.num_scheduled_tokens) == {
         req.request_id for req in (req_a, req_b, req_c)
     }
-    assert output.num_spec_tokens_to_schedule == 2
+    assert output.num_spec_tokens_to_schedule == 0
     assert not kv_cache_manager.is_spec_released(req_a.request_id)
-    assert not kv_cache_manager.is_spec_released(req_b.request_id)
+    assert kv_cache_manager.is_spec_released(req_b.request_id)
     assert kv_cache_manager.is_spec_released(req_c.request_id)
     assert req_c.request_id in mamba_manager.req_to_blocks
     row = mamba_manager.req_to_blocks[req_c.request_id]
@@ -9025,7 +9028,7 @@ def test_uniform_tier_burst_admits_at_demoted_tier(monkeypatch):
     demoted tier instead of the head rows committing the expensive tier
     and stranding the tail in a staggered queue."""
     scheduler = _mamba_priced_scheduler(
-        monkeypatch, num_blocks=20, schedule_table=[(1, 128, 2)]
+        monkeypatch, num_blocks=36, schedule_table=[(1, 128, 2)]
     )
     kv_cache_manager = scheduler.kv_cache_manager
     reqs = create_requests(num_requests=16, num_tokens=16, max_tokens=4, block_size=16)
@@ -9034,9 +9037,10 @@ def test_uniform_tier_burst_admits_at_demoted_tier(monkeypatch):
 
     output = scheduler.schedule()
 
-    # 16 rows need 48 blocks at the K=2 tier but only 16 at K=0 (the
-    # windows are null row slots): the step tier demotes 2 -> 1 -> 0 and
-    # the whole burst admits in one step at the demoted tier.
+    # 16 rows need 64 blocks at the K=2 tier end-state and 32 at K=0
+    # (the windows are null row slots; each row's end state is its
+    # prompt plus its generation cap): the step tier demotes 2 -> 1 -> 0
+    # and the whole burst admits in one step at the demoted tier.
     assert set(output.num_scheduled_tokens) == {req.request_id for req in reqs}
     assert output.num_spec_tokens_to_schedule == 0
     for req in reqs:
@@ -9049,7 +9053,7 @@ def test_uniform_tier_boundary_recovers_at_k0(monkeypatch):
     K=0 and the boundary the staged count lookup stalled at is
     recovered."""
     scheduler = _mamba_priced_scheduler(
-        monkeypatch, num_blocks=20, schedule_table=[(1, 10, 2), (11, 128, 0)]
+        monkeypatch, num_blocks=24, schedule_table=[(1, 10, 2), (11, 128, 0)]
     )
     kv_cache_manager = scheduler.kv_cache_manager
     reqs = create_requests(num_requests=11, num_tokens=16, max_tokens=4, block_size=16)
@@ -9058,9 +9062,10 @@ def test_uniform_tier_boundary_recovers_at_k0(monkeypatch):
 
     output = scheduler.schedule()
 
-    # The formed batch of 11 is the table's K=0 band: every row admits
-    # pinned at K=0 in one step — a staged count lookup would have run
-    # the head rows at the K=2 tier (counts 1-10) until the pool ran out.
+    # The formed batch of 11 is the table's K=0 band and its end-states
+    # (11 x 2 blocks) fit the pool: every row admits pinned at K=0 in
+    # one step — a staged count lookup would have run the head rows at
+    # the K=2 tier (counts 1-10) until the pool ran out.
     assert set(output.num_scheduled_tokens) == {req.request_id for req in reqs}
     assert output.num_spec_tokens_to_schedule == 0
     for req in reqs:
@@ -9083,11 +9088,14 @@ def test_uniform_tier_attention_bound_no_demotion(monkeypatch):
 
     output = scheduler.schedule()
 
-    # 16 rows need 96 blocks at K>0 and 64 at K=0 against a 37-block
-    # pool: no tier fits, so the table tier (K=2) stands. The head rows
-    # admit tier-loyally while they fit and the tail queues — the old
-    # stall behavior, with no rows demoted behind the scheduler's back.
-    assert set(output.num_scheduled_tokens) == {req.request_id for req in reqs[:7]}
+    # 16 rows need 128 blocks at the K=2 end-state and 96 at K=0 against
+    # a 37-block pool: no tier fits, so the table tier (K=2) stands. The
+    # head rows admit tier-loyally while their END-STATE footprint fits
+    # the free pool alongside the running rows' remaining growth (5
+    # rows) and the tail queues — the old stall behavior, with no rows
+    # demoted behind the scheduler's back and no row admitted past the
+    # verdict the pool cannot grow into.
+    assert set(output.num_scheduled_tokens) == {req.request_id for req in reqs[:5]}
     assert output.num_spec_tokens_to_schedule == 2
     for req in reqs:
         assert not kv_cache_manager.is_spec_released(req.request_id)
@@ -9118,3 +9126,40 @@ def test_uniform_tier_bottom_out_refuses_retry(monkeypatch):
     assert output.num_spec_tokens_to_schedule == 2
     for req in reqs:
         assert not kv_cache_manager.is_spec_released(req.request_id)
+
+
+def test_uniform_tier_running_growth_gates_admission(monkeypatch):
+    """The 68K c14 engine-kill shape: the running row's remaining
+    end-state growth (its generation cap) is reserved in the all-pool
+    check, and at the bottom-out a waiting row is admitted only when its
+    end-state fits alongside that growth. The unsound projection priced
+    only the waiting row's prompt, admitted it past the verdict, and the
+    running row's decode growth exhausted the pool the tier-loyal stall
+    exists to prevent."""
+    scheduler = _mamba_priced_scheduler(
+        monkeypatch, num_blocks=16, schedule_table=[(1, 128, 2)]
+    )
+    kv_cache_manager = scheduler.kv_cache_manager
+    mamba_manager = kv_cache_manager.coordinator.single_type_managers[0]
+    (req_a,) = create_requests(
+        num_requests=1, num_tokens=32, max_tokens=128, block_size=16, req_ids=["a"]
+    )
+    scheduler.add_request(req_a)
+    output = scheduler.schedule()
+    assert not kv_cache_manager.is_spec_released(req_a.request_id)
+    _model_output(scheduler, output, [[100]])
+
+    (req_b,) = create_requests(
+        num_requests=1, num_tokens=16, max_tokens=128, block_size=16, req_ids=["b"]
+    )
+    scheduler.add_request(req_b)
+    output = scheduler.schedule()
+    # req_a's remaining growth (8 blocks to its 160-token end state)
+    # plus req_b's end-state (11 blocks at K=2) exceed the free pool: no
+    # tier fits, the table tier stands, and req_b's end-state does not
+    # fit alongside the growth — it stalls instead of admitting past
+    # the verdict, leaving req_a's decode growth funded.
+    assert set(output.num_scheduled_tokens) == {req_a.request_id}
+    assert output.num_spec_tokens_to_schedule == 2
+    assert not kv_cache_manager.is_spec_released(req_b.request_id)
+    assert req_b.request_id not in mamba_manager.req_to_blocks
