@@ -654,12 +654,16 @@ class KVCacheManager:
                 skip_zeroing_group_ids=skip_zeroing_group_ids,
             )
 
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id,
-            num_tokens_need_slot,
-            num_tokens_main_model,
-            num_encoder_tokens,
-        )
+        try:
+            new_blocks = self.coordinator.allocate_new_blocks(
+                request.request_id,
+                num_tokens_need_slot,
+                num_tokens_main_model,
+                num_encoder_tokens,
+            )
+        except ValueError:
+            self._log_allocation_failure(request.request_id, num_tokens_need_slot)
+            raise
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -752,6 +756,37 @@ class KVCacheManager:
         )
         return min(end, self.max_model_len)
 
+    def _log_allocation_failure(
+        self, request_id: str, num_tokens_need_slot: int
+    ) -> None:
+        """Diagnostic context for an allocation failure: the last formed-batch
+        fit-check verdict plus the failing row's per-manager state."""
+        logger.error(
+            "allocation failure context: request=%s num_tokens_need_slot=%s "
+            "last_fit_check=%s",
+            request_id,
+            num_tokens_need_slot,
+            getattr(self, "_last_fit_check", None),
+        )
+        for manager in self.coordinator.single_type_managers:
+            blocks = manager.req_to_blocks.get(request_id)
+            logger.error(
+                "allocation failure row: manager=%s row_len=%s pool_free=%s "
+                "pool_blocks=%s held_end_need=%s",
+                manager.__class__.__name__,
+                len(blocks) if blocks is not None else None,
+                manager.block_pool.get_num_free_blocks(),
+                manager.block_pool.num_gpu_blocks,
+                (
+                    max(
+                        cdiv(num_tokens_need_slot, manager.block_size) - len(blocks),
+                        0,
+                    )
+                    if blocks is not None
+                    else None
+                ),
+            )
+
     def spec_batch_fits_tier(
         self, requests: list[Request], tier: int, reserved_blocks: int = 0
     ) -> bool:
@@ -771,17 +806,36 @@ class KVCacheManager:
         for manager in self.coordinator.single_type_managers:
             pools.setdefault(id(manager.block_pool), []).append(manager)
         end_tokens = [self._request_end_num_tokens(request) for request in requests]
+        self._last_fit_check = {
+            "tier": tier,
+            "formed": len(requests),
+            "watermark": self.watermark_blocks,
+            "reserved": reserved_blocks,
+            "pools": {},
+        }
+        verdict = True
         for pool_managers in pools.values():
             need = sum(
                 manager.spec_batch_tier_need(requests, tier, end_tokens)
                 for manager in pool_managers
             )
-            if need == 0:
-                continue
             free = pool_managers[0].block_pool.get_num_free_blocks()
-            if need + self.watermark_blocks + reserved_blocks > free:
-                return False
-        return True
+            if need == 0:
+                self._last_fit_check["pools"][pool_managers[0].__class__.__name__] = (
+                    need,
+                    free,
+                    True,
+                )
+                continue
+            ok = need + self.watermark_blocks + reserved_blocks <= free
+            self._last_fit_check["pools"][pool_managers[0].__class__.__name__] = (
+                need,
+                free,
+                ok,
+            )
+            if not ok:
+                verdict = False
+        return verdict
 
     def is_spec_released(self, request_id: str) -> bool:
         """Whether the request is pinned at the K=0 spec tier."""
