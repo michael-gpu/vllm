@@ -356,9 +356,7 @@ class Scheduler(SchedulerInterface):
         # Release the running rows' idle speculative windows at the K=0
         # crossing (the born-null row shape) so the admission check
         # prices the freed blocks automatically.
-        self._slot_release = (
-            envs.VLLM_MAMBA_K0_SLOT_RELEASE and self._priced_admission
-        )
+        self._slot_release = envs.VLLM_MAMBA_K0_SLOT_RELEASE and self._priced_admission
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -1196,6 +1194,27 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if (
+                    self._priced_admission
+                    and spec_tier_lookup is not None
+                    and not spec_tier_fits
+                ):
+                    # No tier fits the formed batch's end-state footprint
+                    # (the tier-loyal fallback): a waiting row may still
+                    # admit only while the GROWN batch fits some tier.
+                    # The per-row trickle past the verdict oversubscribed
+                    # the shared pool (the c16@56K engine kill: chunk-sized
+                    # per-row footprints kept fitting the current free,
+                    # the pool ran to zero with end-state growth pending).
+                    grown = self.running + [request]
+                    tier = spec_tier_lookup[min(len(grown), len(spec_tier_lookup) - 1)]
+                    fits = self.kv_cache_manager.spec_batch_fits_tier(grown, tier)
+                    while tier > 0 and not fits:
+                        tier -= 1
+                        fits = self.kv_cache_manager.spec_batch_fits_tier(grown, tier)
+                    if not fits:
+                        break
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:

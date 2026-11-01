@@ -9016,6 +9016,8 @@ def _hybrid_priced_scheduler(
     monkeypatch: pytest.MonkeyPatch,
     num_blocks: int,
     schedule_table: list[tuple[int, int, int]],
+    max_num_batched_tokens: int = 8192,
+    scheduler_reserve_full_isl: bool = True,
 ):
     """A full-attention + mamba-align scheduler with a dynamic spec-tier
     table and a tight shared pool, for the formed-batch uniform-tier
@@ -9025,6 +9027,8 @@ def _hybrid_priced_scheduler(
         max_num_seqs=16,
         num_blocks=num_blocks,
         block_size=16,
+        max_num_batched_tokens=max_num_batched_tokens,
+        scheduler_reserve_full_isl=scheduler_reserve_full_isl,
         num_speculative_tokens=2,
         num_speculative_tokens_per_batch_size=schedule_table,
         kv_cache_spec=MambaSpec(
@@ -9199,3 +9203,41 @@ def test_uniform_tier_running_growth_gates_admission(monkeypatch):
     assert not kv_cache_manager.is_spec_released(req_b.request_id)
     assert req_b.request_id not in mamba_manager.req_to_blocks
     assert req_b.request_id not in attn_manager.req_to_blocks
+
+
+def test_uniform_tier_refusal_gates_admission(monkeypatch):
+    """The batch-level refusal must gate ADMISSION itself: when no tier
+    fits the formed batch's end-state footprint, a waiting row whose
+    per-row footprint happens to fit the current free must still stall
+    once the grown batch no longer fits any tier. The ungated trickle
+    admitted rows past the verdict on the shared hybrid pool (the
+    c16@56K engine kill: chunk-sized per-row footprints kept fitting,
+    the pool ran to zero free with end-state growth pending, and a
+    running row's chunk allocation killed the engine)."""
+    scheduler = _hybrid_priced_scheduler(
+        monkeypatch,
+        num_blocks=112,
+        schedule_table=[(1, 8, 2), (9, 16, 1), (17, 128, 0)],
+        max_num_batched_tokens=128,
+        scheduler_reserve_full_isl=False,
+    )
+    reqs = create_requests(
+        num_requests=6, num_tokens=320, max_tokens=32, block_size=16
+    )
+    for req in reqs:
+        scheduler.add_request(req)
+
+    # Per-row end state: 22 attention blocks (320+32 tokens) + 5 mamba
+    # (K=2 resident) = 27. Four rows fit the 112-block pool (108); a
+    # fifth pushes it to 135: no tier fits the grown batch, so the
+    # admission must cap at 4 instead of trickling to six (whose 162
+    # blocks of end state cannot exist). Chunked prefill (128-token
+    # chunks) keeps every per-row admission footprint small enough to
+    # fit the current free all the way to oversubscription.
+    for _ in range(40):
+        output = scheduler.schedule()
+        if not output.num_scheduled_tokens:
+            break
+        _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+
+    assert len(scheduler.running) <= 4
