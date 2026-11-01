@@ -760,7 +760,8 @@ class KVCacheManager:
         self, request_id: str, num_tokens_need_slot: int
     ) -> None:
         """Diagnostic context for an allocation failure: the last formed-batch
-        fit-check verdict plus the failing row's per-manager state."""
+        fit-check verdict, the failing row's per-manager state, and every
+        allocated row's per-manager real (non-null) block count."""
         logger.error(
             "allocation failure context: request=%s num_tokens_need_slot=%s "
             "last_fit_check=%s",
@@ -785,6 +786,28 @@ class KVCacheManager:
                     if blocks is not None
                     else None
                 ),
+            )
+        for manager in self.coordinator.single_type_managers:
+            rows = {}
+            real_sum = 0
+            for req_id, row in manager.req_to_blocks.items():
+                if not row:
+                    continue
+                real = sum(1 for block in row if not block.is_null)
+                real_sum += real
+                entry = [len(row), real]
+                if isinstance(manager, MambaManager):
+                    entry.append(req_id in manager._spec_released)
+                    entry.append(req_id in manager._checkpoints)
+                rows[req_id] = entry
+            logger.error(
+                "allocation failure rows: manager=%s real_sum=%s free=%s "
+                "pool=%s rows=%s",
+                manager.__class__.__name__,
+                real_sum,
+                manager.block_pool.get_num_free_blocks(),
+                manager.block_pool.num_gpu_blocks,
+                rows,
             )
 
     def spec_batch_fits_tier(
