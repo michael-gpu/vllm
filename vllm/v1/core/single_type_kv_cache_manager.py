@@ -1241,6 +1241,18 @@ class CircularBufferManager(FullAttentionManager):
     ) -> int:
         return 0 if self.req_to_blocks.get(request_id) else 1
 
+    def spec_batch_tier_need(
+        self, requests: list[Request], tier: int, end_tokens: list[int]
+    ) -> int:
+        """The ring holds ONE block per request for its whole lifetime
+        (CircularBufferSpec.max_memory_usage_bytes) — length-independent,
+        so the formed-batch projection is the not-yet-allocated rows
+        alone."""
+        del tier, end_tokens
+        return sum(
+            1 for request in requests if request.request_id not in self.req_to_blocks
+        )
+
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
