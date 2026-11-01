@@ -2185,6 +2185,35 @@ class MambaManager(SingleTypeKVCacheManager):
         self._spec_row_rebuilds.add(request_id)
         return True
 
+    def release_spec_blocks(self, request_id: str) -> bool:
+        """Swap the running row's real window blocks for null slots at the
+        K=0 crossing: the hedge blocks return to the pool, the positions
+        stay (the born-null row shape), and the row joins the pin set.
+
+        The hedge slots are empty allocations, not computed data: the
+        committed state lives in the base blocks, so freeing them is
+        lossless and the promotion's fresh-block refill needs no replay.
+        Only real positions are freed — nulls (boundary-advance states or
+        a born-null window) stay. Returns True when blocks were freed
+        (the runner row must be rebuilt)."""
+        if self.num_speculative_blocks <= 0 or request_id in self._spec_released:
+            return False
+        req_blocks = self.req_to_blocks.get(request_id)
+        if not req_blocks or len(req_blocks) < self.num_speculative_blocks:
+            return False
+        tail_start = len(req_blocks) - self.num_speculative_blocks
+        freed: list[KVCacheBlock] = []
+        for i in range(tail_start, len(req_blocks)):
+            if req_blocks[i] == self._null_block:
+                continue
+            freed.append(req_blocks[i])
+            req_blocks[i] = self._null_block
+        self._spec_released.add(request_id)
+        if freed:
+            self.block_pool.free_blocks(freed)
+            self._spec_row_rebuilds.add(request_id)
+        return bool(freed)
+
     def _relocate_speculative_block(
         self, req_blocks: list[KVCacheBlock], block_idx: int
     ) -> None:

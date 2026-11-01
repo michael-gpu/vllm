@@ -8955,6 +8955,40 @@ def test_priced_admission_no_promotion_while_table_schedules_k0(monkeypatch):
     assert kv_cache_manager.is_spec_released(req_b.request_id)
 
 
+def test_slot_release_frees_running_window_at_k0_crossing(monkeypatch):
+    """With the slot-release knob on, a running row admitted at the K>0
+    tier has its idle window released when the step's uniform tier lands
+    at K=0: the hedge blocks return to the pool and the row joins the
+    pin set (the priced promotion lifts it when the tier rises)."""
+    monkeypatch.setenv("VLLM_MAMBA_K0_SLOT_RELEASE", "1")
+    scheduler = _mamba_priced_scheduler(
+        monkeypatch, num_blocks=12, schedule_table=[(1, 1, 2), (2, 16, 0)]
+    )
+    kv_cache_manager = scheduler.kv_cache_manager
+    mamba_manager = kv_cache_manager.coordinator.single_type_managers[0]
+    req_a, req_b = create_requests(
+        num_requests=2, num_tokens=32, max_tokens=4, block_size=16
+    )
+    scheduler.add_request(req_a)
+    output = scheduler.schedule()
+    # req_a admits alone at the table's K=2 tier: real window, no pin.
+    assert not kv_cache_manager.is_spec_released(req_a.request_id)
+    assert mamba_manager.req_to_blocks[req_a.request_id][-2:] != [
+        kv_cache_manager.block_pool.null_block
+    ] * 2
+    _model_output(scheduler, output, [[100]])
+
+    scheduler.add_request(req_b)
+    output = scheduler.schedule()
+    # The formed batch of 2 lands at the K=0 tier: req_b is born pinned,
+    # and req_a's idle window is released into null slots.
+    assert kv_cache_manager.is_spec_released(req_b.request_id)
+    assert kv_cache_manager.is_spec_released(req_a.request_id)
+    assert mamba_manager.req_to_blocks[req_a.request_id][-2:] == [
+        kv_cache_manager.block_pool.null_block
+    ] * 2
+
+
 def test_priced_admission_batch_aware_prior_pins_burst(monkeypatch):
     """The admission tier is the table's answer for the batch being FORMED
     (scheduled + waiting), not the staged running count: a burst whose

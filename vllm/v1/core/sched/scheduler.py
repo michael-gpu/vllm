@@ -353,6 +353,12 @@ class Scheduler(SchedulerInterface):
         self._priced_admission = (
             envs.VLLM_MAMBA_PRICED_ADMISSION and self.dynamic_sd_lookup is not None
         )
+        # Release the running rows' idle speculative windows at the K=0
+        # crossing (the born-null row shape) so the admission check
+        # prices the freed blocks automatically.
+        self._slot_release = (
+            envs.VLLM_MAMBA_K0_SLOT_RELEASE and self._priced_admission
+        )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -1083,6 +1089,24 @@ class Scheduler(SchedulerInterface):
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
             )
+
+            # K=0 slot release: while the step's uniform tier schedules
+            # K=0, a running row's speculative window is an idle hedge —
+            # swap it for null slots (the born-null row shape) and return
+            # the blocks to the pool, where the admission check prices
+            # them automatically. Only decode-phase rows release: the
+            # window is idle draft state until the row decodes.
+            if (
+                self._slot_release
+                and step_tier == 0
+                and not (request.is_prefill_chunk)
+                and self.kv_cache_manager.release_spec_blocks(request_id)
+            ):
+                # The released row runs no drafts from now on; leftover
+                # drafts from the last K>0 step would verify against the
+                # nulled window's zero states.
+                request.spec_token_ids = []
+                logger.info("K0 slot release: %s window freed", request_id)
 
             # Priced promotion: while the step's uniform tier schedules
             # K>0, a row whose window is null row slots is refilled to the
