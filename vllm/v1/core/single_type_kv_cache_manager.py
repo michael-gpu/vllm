@@ -2077,32 +2077,28 @@ class MambaManager(SingleTypeKVCacheManager):
         """End-state mamba row need summed over the formed batch (the
         formed-batch fit projection).
 
-        The projection is prefix-hit-blind: it reserves the full row for
-        every request, which can only over-price an admission — the
-        per-row priced retry stays the net for the opposite error. The
-        row's end length is tier-independent (cdiv(end_tokens) plus the
-        window); the tier only decides physical hedge blocks versus null
-        row slots. Rows not yet allocated reserve the full end state
-        (minus the window at the K=0 tier, where it is born null);
-        allocated rows reserve the remaining growth to it — for a pinned
-        row the held count is credited by the window because its null
-        positions refill from the pool as the boundary advances (at most
-        the window's worth, the same term promotion refills).
+        The align row's pool footprint is its RESIDENT state set —
+        2 + window + checkpoint pages, length-independent
+        (MambaSpec.max_memory_usage_bytes): the row table's per-token
+        slots are nulls outside the resident set, and the boundary
+        advance nulls old states as it allocates fresh ones, so an
+        allocated row's remaining growth is the pinned window's
+        promotion refill alone. The projection prices the resident
+        ceiling for every not-yet-allocated row (prefix-hit-blind, which
+        can only over-price an admission — the per-row priced retry
+        stays the net for the opposite error).
         """
         if self.num_speculative_blocks <= 0 or self.mamba_cache_mode != "align":
             return 0
+        del end_tokens
+        resident = 2 + self.kv_cache_spec.num_prefill_checkpoint_blocks
         window = self.num_speculative_blocks
         need = 0
-        for request, end in zip(requests, end_tokens):
-            end_blocks = cdiv(end, self.block_size) + window
-            blocks = self.req_to_blocks.get(request.request_id)
-            if blocks is None:
-                need += end_blocks if tier > 0 else end_blocks - window
-                continue
-            held = len(blocks)
-            if request.request_id in self._spec_released:
-                held -= window
-            need += max(end_blocks - held, 0)
+        for request in requests:
+            if self.req_to_blocks.get(request.request_id) is None:
+                need += resident + (window if tier > 0 else 0)
+            elif tier > 0 and request.request_id in self._spec_released:
+                need += window
         return need
 
     def mark_spec_admission_tier0(self, request_id: str) -> bool:

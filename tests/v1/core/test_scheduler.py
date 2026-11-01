@@ -9136,13 +9136,14 @@ def test_uniform_tier_running_growth_gates_admission(monkeypatch):
     only the waiting row's prompt, admitted it past the verdict, and the
     running row's decode growth exhausted the pool the tier-loyal stall
     exists to prevent."""
-    scheduler = _mamba_priced_scheduler(
+    scheduler = _hybrid_priced_scheduler(
         monkeypatch, num_blocks=16, schedule_table=[(1, 128, 2)]
     )
     kv_cache_manager = scheduler.kv_cache_manager
-    mamba_manager = kv_cache_manager.coordinator.single_type_managers[0]
+    mamba_manager = kv_cache_manager.coordinator.single_type_managers[1]
+    attn_manager = kv_cache_manager.coordinator.single_type_managers[0]
     (req_a,) = create_requests(
-        num_requests=1, num_tokens=32, max_tokens=128, block_size=16, req_ids=["a"]
+        num_requests=1, num_tokens=32, max_tokens=96, block_size=16, req_ids=["a"]
     )
     scheduler.add_request(req_a)
     output = scheduler.schedule()
@@ -9150,16 +9151,17 @@ def test_uniform_tier_running_growth_gates_admission(monkeypatch):
     _model_output(scheduler, output, [[100]])
 
     (req_b,) = create_requests(
-        num_requests=1, num_tokens=16, max_tokens=128, block_size=16, req_ids=["b"]
+        num_requests=1, num_tokens=32, max_tokens=96, block_size=16, req_ids=["b"]
     )
     scheduler.add_request(req_b)
     output = scheduler.schedule()
-    # req_a's remaining growth (8 blocks to its 160-token end state)
-    # plus req_b's end-state (11 blocks at K=2) exceed the free pool: no
-    # tier fits, the table tier stands, and req_b's end-state does not
-    # fit alongside the growth — it stalls instead of admitting past
-    # the verdict, leaving req_a's decode growth funded.
+    # req_a's remaining attention growth (5 blocks to its 128-token end
+    # state) plus req_b's end-state (8 attention + 4 mamba) exceed the
+    # free pool: no tier fits, the table tier stands, and req_b's
+    # end-state does not fit alongside the growth — it stalls instead of
+    # admitting past the verdict, leaving req_a's decode growth funded.
     assert set(output.num_scheduled_tokens) == {req_a.request_id}
     assert output.num_spec_tokens_to_schedule == 2
     assert not kv_cache_manager.is_spec_released(req_b.request_id)
     assert req_b.request_id not in mamba_manager.req_to_blocks
+    assert req_b.request_id not in attn_manager.req_to_blocks
