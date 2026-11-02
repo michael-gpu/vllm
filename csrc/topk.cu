@@ -308,10 +308,11 @@ void persistent_topk(const torch::stable::Tensor& logits,
       logits.get_device_index());
 
   if (k == 64) {
-    launch_persistent_topk<64>(logits, lengths, output, workspace, max_seq_len);
+    launch_persistent_topk_dtype<64>(logits, lengths, output, workspace,
+                                     max_seq_len);
   } else if (k == 128) {
-    launch_persistent_topk<128>(logits, lengths, output, workspace,
-                                max_seq_len);
+    launch_persistent_topk_dtype<128>(logits, lengths, output, workspace,
+                                      max_seq_len);
   } else if (k == 512) {
     launch_persistent_topk_dtype<512>(logits, lengths, output, workspace,
                                       max_seq_len);
