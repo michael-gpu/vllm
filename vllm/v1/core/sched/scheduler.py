@@ -357,6 +357,12 @@ class Scheduler(SchedulerInterface):
         # crossing (the born-null row shape) so the admission check
         # prices the freed blocks automatically.
         self._slot_release = envs.VLLM_MAMBA_K0_SLOT_RELEASE and self._priced_admission
+        if envs.VLLM_MAMBA_K0_SLOT_RELEASE and not self._slot_release:
+            logger.warning(
+                "VLLM_MAMBA_K0_SLOT_RELEASE has no effect without "
+                "VLLM_MAMBA_PRICED_ADMISSION (and a mamba spec-tier "
+                "table); ignoring it."
+            )
 
         # Create the KV cache manager.
         if hash_block_size is None:
