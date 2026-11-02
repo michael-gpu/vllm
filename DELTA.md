@@ -1,16 +1,16 @@
 <!-- markdownlint-disable MD060 -->
 # Delta vs upstream vLLM
 
-`main` = upstream `main` (nightly merge) + the commits below: 33 source commits (70 files changed, 4330 insertions(+), 346 deletions(-)).
+`main` = upstream `main` (nightly merge) + the commits below: 34 source commits (70 files changed, 4331 insertions(+), 346 deletions(-)).
 
 Diff base: upstream commit `5cdeea9b13` — the tip this tree last merged from origin. Reproduce at this commit with:
-`git log --no-merges 5cdeea9b13..6eb732729b -- vllm/ csrc/` and `git diff --stat 5cdeea9b13..6eb732729b -- vllm/ csrc/`.
+`git log --no-merges 5cdeea9b13..0f03b25c08 -- vllm/ csrc/` and `git diff --stat 5cdeea9b13..0f03b25c08 -- vllm/ csrc/`.
 
 Areas upstream does not ship for this hardware are what this distribution exists to carry; general fixes are contributed upstream first (see README). Regenerated automatically by the nightly integrate.
 
 | Area | Commits |
 |---|---|
-| general fixes | 12 |
+| general fixes | 13 |
 | spec-decode fixes | 11 |
 | model bring-up (GLM5Next / Qwen4Exp / DSV41) | 3 |
 | sparse attention (TRITON_MLA_SPARSE) | 2 |
@@ -22,6 +22,7 @@ Areas upstream does not ship for this hardware are what this distribution exists
 
 <details><summary>Full commit list</summary>
 
+- fix: route the k=64/128 persistent-topk arms through the dtype wrapper after the upstream launcher split (0f03b25c08)
 - fix: restore the SM80 triton fallback + DeepGEMM gate in the sparse indexer after the upstream restructure (aeec9d9df2)
 - Revert "Merge branch 'perf/eagle-k0-lifecycle' into next" (9107e1fba5)
 - Revert "fix(spec): eagle K=0 resume re-growth must reach the runner's block table" (183ef23a1a)
