@@ -363,9 +363,7 @@ def test_mamba_k0_crossing_release_swaps_window_for_nulls():
     assert manager.release_spec_blocks("r") is False
 
     assert manager.promote_spec_blocks("r") is True
-    assert all(
-        block.ref_cnt == 1 for block in manager.req_to_blocks["r"][-2:]
-    )
+    assert all(block.ref_cnt == 1 for block in manager.req_to_blocks["r"][-2:])
     assert not manager.is_spec_released("r")
 
 

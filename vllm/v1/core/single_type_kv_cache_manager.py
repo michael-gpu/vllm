@@ -1483,6 +1483,9 @@ class MambaManager(SingleTypeKVCacheManager):
             "Mamba prefix caching requires mamba_cache_mode='align'"
         )
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        self.num_prefill_checkpoint_blocks: int = (
+            kv_cache_spec.num_prefill_checkpoint_blocks
+        )
         self.has_prefill_checkpoint_blocks = (
             self.mamba_cache_mode == "align"
             and kv_cache_spec.num_prefill_checkpoint_blocks > 0
@@ -2113,7 +2116,7 @@ class MambaManager(SingleTypeKVCacheManager):
         """
         if self.num_speculative_blocks <= 0 or self.mamba_cache_mode != "align":
             return 0
-        resident = 2 + self.kv_cache_spec.num_prefill_checkpoint_blocks
+        resident = 2 + self.num_prefill_checkpoint_blocks
         window = self.num_speculative_blocks
         ceiling = resident + window + 2
         need = 0
