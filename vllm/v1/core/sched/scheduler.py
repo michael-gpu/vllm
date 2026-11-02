@@ -353,6 +353,10 @@ class Scheduler(SchedulerInterface):
         self._priced_admission = (
             envs.VLLM_MAMBA_PRICED_ADMISSION and self.dynamic_sd_lookup is not None
         )
+        # Release the running rows' idle speculative windows at the K=0
+        # crossing (the born-null row shape) so the admission check
+        # prices the freed blocks automatically.
+        self._slot_release = envs.VLLM_MAMBA_K0_SLOT_RELEASE and self._priced_admission
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -1084,6 +1088,24 @@ class Scheduler(SchedulerInterface):
                 request, request.num_computed_tokens, num_new_tokens
             )
 
+            # K=0 slot release: while the step's uniform tier schedules
+            # K=0, a running row's speculative window is an idle hedge —
+            # swap it for null slots (the born-null row shape) and return
+            # the blocks to the pool, where the admission check prices
+            # them automatically. Only decode-phase rows release: the
+            # window is idle draft state until the row decodes.
+            if (
+                self._slot_release
+                and step_tier == 0
+                and not (request.is_prefill_chunk)
+                and self.kv_cache_manager.release_spec_blocks(request_id)
+            ):
+                # The released row runs no drafts from now on; leftover
+                # drafts from the last K>0 step would verify against the
+                # nulled window's zero states.
+                request.spec_token_ids = []
+                logger.info("K0 slot release: %s window freed", request_id)
+
             # Priced promotion: while the step's uniform tier schedules
             # K>0, a row whose window is null row slots is refilled to the
             # full spec tier when the pool fits it (plus the admission
@@ -1172,6 +1194,26 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if (
+                    self._priced_admission
+                    and spec_tier_lookup is not None
+                    and not spec_tier_fits
+                ):
+                    # No tier fits the formed batch's end-state footprint
+                    # (tier-loyal fallback): a waiting row may still admit
+                    # only while the GROWN batch fits some tier. The per-row
+                    # trickle past the verdict oversubscribed the shared
+                    # pool (the c16@56K engine kill: chunk-sized footprints
+                    # kept fitting the current free, the pool ran to zero).
+                    grown = self.running + [request]
+                    tier = spec_tier_lookup[min(len(grown), len(spec_tier_lookup) - 1)]
+                    fits = self.kv_cache_manager.spec_batch_fits_tier(grown, tier)
+                    while tier > 0 and not fits:
+                        tier -= 1
+                        fits = self.kv_cache_manager.spec_batch_fits_tier(grown, tier)
+                    if not fits:
+                        break
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:

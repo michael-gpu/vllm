@@ -8821,6 +8821,51 @@ def _mamba_priced_scheduler(
     )
 
 
+def test_mamba_tier0_climb_price_bounds(monkeypatch):
+    """Pins both branches of the tier-0 climb pricing. An unallocated row
+    that admission will pin prices min(ceiling, end_span): the climb is
+    bounded by the row's boundary crossings, so a short-span row prices
+    BELOW the old resident floor (an intentional loosening — the row
+    holds one state block and never crosses), and a long-span row prices
+    at the ceiling. An allocated pinned row prices only its remaining
+    climb, bounded by the crossings ahead — zero once the row reaches
+    its end-state span (the decode settle)."""
+    scheduler = _mamba_priced_scheduler(
+        monkeypatch, num_blocks=10, schedule_table=[(1, 128, 2)]
+    )
+    mamba_manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    # ceiling = resident(2) + window(2) + advance slack(2) = 6.
+    (short,) = create_requests(
+        num_requests=1, num_tokens=16, max_tokens=4, block_size=16, req_ids=["short"]
+    )
+    assert mamba_manager.spec_batch_tier_need([short], 0, [20]) == 2
+    (long,) = create_requests(
+        num_requests=1,
+        num_tokens=16,
+        max_tokens=1000,
+        block_size=16,
+        req_ids=["long"],
+    )
+    assert mamba_manager.spec_batch_tier_need([long], 0, [1016]) == 6
+
+    # Allocated + pinned, mid-climb: 1 real block in a 3-slot row, 63
+    # crossings ahead → min(6 - 1, 63) = 5.
+    pool = mamba_manager.block_pool
+    row = [pool.get_new_blocks(1)[0], pool.null_block, pool.null_block]
+    mamba_manager.req_to_blocks[long.request_id] = row
+    mamba_manager._spec_released.add(long.request_id)
+    assert mamba_manager.spec_batch_tier_need([long], 0, [1016]) == 5
+
+    # Row at its end-state span (64 + window 2): no crossings ahead, no
+    # remaining climb — the decode settle.
+    full_row = row + [pool.null_block] * 63
+    mamba_manager.req_to_blocks[long.request_id] = full_row
+    assert mamba_manager.spec_batch_tier_need([long], 0, [1016]) == 0
+
+    # Tier>0 pricing is unchanged: a pinned row prices its window alone.
+    assert mamba_manager.spec_batch_tier_need([long], 2, [1016]) == 2
+
+
 def test_priced_admission_degrades_to_k0_before_stalling(monkeypatch):
     """Formed-batch uniform tier, the margin pressure shape: the running
     row's remaining growth plus the waiting rows' end-states do not fit
@@ -8955,6 +9000,42 @@ def test_priced_admission_no_promotion_while_table_schedules_k0(monkeypatch):
     assert kv_cache_manager.is_spec_released(req_b.request_id)
 
 
+def test_slot_release_frees_running_window_at_k0_crossing(monkeypatch):
+    """With the slot-release knob on, a running row admitted at the K>0
+    tier has its idle window released when the step's uniform tier lands
+    at K=0: the hedge blocks return to the pool and the row joins the
+    pin set (the priced promotion lifts it when the tier rises)."""
+    monkeypatch.setenv("VLLM_MAMBA_K0_SLOT_RELEASE", "1")
+    scheduler = _mamba_priced_scheduler(
+        monkeypatch, num_blocks=12, schedule_table=[(1, 1, 2), (2, 16, 0)]
+    )
+    kv_cache_manager = scheduler.kv_cache_manager
+    mamba_manager = kv_cache_manager.coordinator.single_type_managers[0]
+    req_a, req_b = create_requests(
+        num_requests=2, num_tokens=32, max_tokens=4, block_size=16
+    )
+    scheduler.add_request(req_a)
+    output = scheduler.schedule()
+    # req_a admits alone at the table's K=2 tier: real window, no pin.
+    assert not kv_cache_manager.is_spec_released(req_a.request_id)
+    assert (
+        mamba_manager.req_to_blocks[req_a.request_id][-2:]
+        != [kv_cache_manager.block_pool.null_block] * 2
+    )
+    _model_output(scheduler, output, [[100]])
+
+    scheduler.add_request(req_b)
+    output = scheduler.schedule()
+    # The formed batch of 2 lands at the K=0 tier: req_b is born pinned,
+    # and req_a's idle window is released into null slots.
+    assert kv_cache_manager.is_spec_released(req_b.request_id)
+    assert kv_cache_manager.is_spec_released(req_a.request_id)
+    assert (
+        mamba_manager.req_to_blocks[req_a.request_id][-2:]
+        == [kv_cache_manager.block_pool.null_block] * 2
+    )
+
+
 def test_priced_admission_batch_aware_prior_pins_burst(monkeypatch):
     """The admission tier is the table's answer for the batch being FORMED
     (scheduled + waiting), not the staged running count: a burst whose
@@ -8982,6 +9063,8 @@ def _hybrid_priced_scheduler(
     monkeypatch: pytest.MonkeyPatch,
     num_blocks: int,
     schedule_table: list[tuple[int, int, int]],
+    max_num_batched_tokens: int = 8192,
+    scheduler_reserve_full_isl: bool = True,
 ):
     """A full-attention + mamba-align scheduler with a dynamic spec-tier
     table and a tight shared pool, for the formed-batch uniform-tier
@@ -8991,6 +9074,8 @@ def _hybrid_priced_scheduler(
         max_num_seqs=16,
         num_blocks=num_blocks,
         block_size=16,
+        max_num_batched_tokens=max_num_batched_tokens,
+        scheduler_reserve_full_isl=scheduler_reserve_full_isl,
         num_speculative_tokens=2,
         num_speculative_tokens_per_batch_size=schedule_table,
         kv_cache_spec=MambaSpec(
@@ -9165,3 +9250,38 @@ def test_uniform_tier_running_growth_gates_admission(monkeypatch):
     assert not kv_cache_manager.is_spec_released(req_b.request_id)
     assert req_b.request_id not in mamba_manager.req_to_blocks
     assert req_b.request_id not in attn_manager.req_to_blocks
+
+
+def test_uniform_tier_refusal_gates_admission(monkeypatch):
+    """The batch-level refusal must gate ADMISSION itself: when no tier
+    fits the formed batch's end-state footprint, a waiting row whose
+    per-row footprint happens to fit the current free must still stall
+    once the grown batch no longer fits any tier. The ungated trickle
+    admitted rows past the verdict on the shared hybrid pool (the
+    c16@56K engine kill: chunk-sized per-row footprints kept fitting,
+    the pool ran to zero free with end-state growth pending, and a
+    running row's chunk allocation killed the engine)."""
+    scheduler = _hybrid_priced_scheduler(
+        monkeypatch,
+        num_blocks=112,
+        schedule_table=[(1, 8, 2), (9, 16, 1), (17, 128, 0)],
+        max_num_batched_tokens=128,
+        scheduler_reserve_full_isl=False,
+    )
+    reqs = create_requests(num_requests=6, num_tokens=320, max_tokens=32, block_size=16)
+    for req in reqs:
+        scheduler.add_request(req)
+
+    # Per-row end state: 22 attention blocks (320+32 tokens) + 5 mamba
+    # (K=2 resident) = 27. Four rows fit the 112-block pool (108); a
+    # fifth pushes it to 135: no tier fits the grown batch, so admission
+    # must cap at 4 instead of trickling to six (whose 162 blocks of end
+    # state cannot exist). Chunked prefill (128-token chunks) keeps every
+    # per-row footprint small enough to fit the current free.
+    for _ in range(40):
+        output = scheduler.schedule()
+        if not output.num_scheduled_tokens:
+            break
+        _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+
+    assert len(scheduler.running) <= 4

@@ -345,6 +345,30 @@ def test_mamba_pin_cleared_on_free():
     assert not manager.is_spec_released("r")
 
 
+def test_mamba_k0_crossing_release_swaps_window_for_nulls():
+    """At the K=0 crossing a running row's real window is an idle hedge:
+    the release frees it into null positions (the born-null row shape),
+    joins the pin set, and the priced promotion refills fresh blocks
+    without replay."""
+    manager, pool = _align_manager()
+    manager.allocate_new_blocks("r", num_tokens=8, num_tokens_main_model=8)
+    assert manager.req_to_blocks["r"][-2:] != [pool.null_block, pool.null_block]
+    free_before = pool.get_num_free_blocks()
+
+    assert manager.release_spec_blocks("r") is True
+    assert manager.req_to_blocks["r"][-2:] == [pool.null_block, pool.null_block]
+    assert pool.get_num_free_blocks() == free_before + 2
+    assert manager.is_spec_released("r")
+    assert manager.take_spec_row_rebuilds() == {"r"}
+    assert manager.release_spec_blocks("r") is False
+
+    assert manager.promote_spec_blocks("r") is True
+    assert all(
+        block.ref_cnt == 1 for block in manager.req_to_blocks["r"][-2:]
+    )
+    assert not manager.is_spec_released("r")
+
+
 def test_mamba_retirement_crosses_null_gaps():
     spec = MambaSpec(
         block_size=4,

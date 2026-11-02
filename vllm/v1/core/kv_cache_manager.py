@@ -805,6 +805,17 @@ class KVCacheManager:
                 promoted = manager.promote_spec_blocks(request_id, reserve) or promoted
         return promoted
 
+    def release_spec_blocks(self, request_id: str) -> bool:
+        """Swap the running row's real window blocks for null slots (the
+        K=0 crossing release). Returns True when any mamba group released
+        blocks (the runner row is marked for rebuild and must be routed
+        through the resumed channel)."""
+        released = False
+        for manager in self.coordinator.single_type_managers:
+            if isinstance(manager, MambaManager):
+                released = manager.release_spec_blocks(request_id) or released
+        return released
+
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping and return its blocks without
         returning them to the block pool. The caller must eventually free

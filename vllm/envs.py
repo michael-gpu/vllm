@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_MAMBA_PRICED_ADMISSION: bool = False
+    VLLM_MAMBA_K0_SLOT_RELEASE: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
@@ -1109,6 +1110,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (priced) when the count-based tier rises above it. Default: off
     "VLLM_MAMBA_PRICED_ADMISSION": lambda: bool(
         int(os.getenv("VLLM_MAMBA_PRICED_ADMISSION", "0"))
+    ),
+    # Release the running rows' idle speculative windows at the K=0
+    # crossing (the born-null row shape); the admission check prices the
+    # freed blocks automatically. Requires VLLM_MAMBA_PRICED_ADMISSION.
+    # Default: off
+    "VLLM_MAMBA_K0_SLOT_RELEASE": lambda: bool(
+        int(os.getenv("VLLM_MAMBA_K0_SLOT_RELEASE", "0"))
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

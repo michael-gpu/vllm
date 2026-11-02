@@ -92,6 +92,7 @@ def create_scheduler(
     scheduling_policy: SchedulerPolicy = "fcfs",
     diffusion_canvas_length: int | None = None,
     scheduler_cls: type[Scheduler] | None = None,
+    scheduler_reserve_full_isl: bool = True,
     kv_cache_valve_threshold: float = 0.0,
     lora_config: LoRAConfig | None = None,
     speculative_config: SpeculativeConfig | None = None,
@@ -144,6 +145,7 @@ def create_scheduler(
         prefill_schedule_interval=prefill_schedule_interval,
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
+        scheduler_reserve_full_isl=scheduler_reserve_full_isl,
         kv_cache_valve_threshold=kv_cache_valve_threshold,
         policy=scheduling_policy,
     )
