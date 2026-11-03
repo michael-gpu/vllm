@@ -2,6 +2,15 @@
 
 # Recipes
 
+The site, the command builder, and the JSON API are built by
+[vllm-project/recipes](https://github.com/vllm-project/recipes). That
+repository owns the schema and the shared vocabulary (hardware profiles,
+serving strategies, KV-offload deployments) and pins this directory to a
+commit. Omni (image, video, audio) recipes live in vllm-project/vllm-omni, and
+Ascend NPU content lives in vllm-project/vllm-ascend as overlays that merge into
+these recipes when the site is built. Don't add Ascend hardware here: open those
+changes against `recipes/overlays/` in vllm-ascend.
+
 Configs for model + GPU combinations, with the data showing why they beat the
 alternatives. Every recipe states the mechanism (why it works) and includes
 measured numbers — a config without data is a guess, not a recipe.

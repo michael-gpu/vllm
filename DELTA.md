@@ -1,26 +1,42 @@
 <!-- markdownlint-disable MD060 -->
 # Delta vs upstream vLLM
 
-`main` = upstream `main` (nightly merge) + the commits below: 20 source commits (74 files changed, 4883 insertions(+), 291 deletions(-)).
+`main` = upstream `main` (nightly merge) + the commits below: 35 source commits (70 files changed, 4368 insertions(+), 365 deletions(-)).
 
-Diff base: upstream commit `914d61fc53` — the tip this tree last merged from origin. Reproduce at this commit with:
-`git log --no-merges 914d61fc53..575219c5e1 -- vllm/ csrc/` and `git diff --stat 914d61fc53..575219c5e1 -- vllm/ csrc/`.
+Diff base: upstream commit `32d6ddea18` — the tip this tree last merged from origin. Reproduce at this commit with:
+`git log --no-merges 32d6ddea18..e109d84815 -- vllm/ csrc/` and `git diff --stat 32d6ddea18..e109d84815 -- vllm/ csrc/`.
 
 Areas upstream does not ship for this hardware are what this distribution exists to carry; general fixes are contributed upstream first (see README). Regenerated automatically by the nightly integrate.
 
 | Area | Commits |
 |---|---|
-| spec-decode fixes | 7 |
-| general fixes | 6 |
-| model bring-up (GLM5Next / Qwen4Exp / DSV41) | 2 |
+| general fixes | 13 |
+| spec-decode fixes | 11 |
+| sparse attention (TRITON_MLA_SPARSE) | 3 |
+| model bring-up (GLM5Next / Qwen4Exp / DSV41) | 3 |
+| fork delta (squash: spec-decode fixes + KV-cache / offload fixes) | 1 |
 | KV-cache / offload fixes | 1 |
 | fork delta (squash: sparse attention (TRITON_MLA_SPARSE) + KV-cache / offload fixes) | 1 |
 | fork delta (squash: sparse attention (TRITON_MLA_SPARSE) + spec-decode fixes) | 1 |
-| sparse attention (TRITON_MLA_SPARSE) | 1 |
 | fork delta (squash: sparse attention (TRITON_MLA_SPARSE) + SM80 / pre-SM89 fp8 fallbacks + model bring-up (GLM5Next / Qwen4Exp / DSV41) + spec-decode fixes + KV-cache / offload fixes) | 1 |
 
 <details><summary>Full commit list</summary>
 
+- fix: restore the decode-path SM80 triton fallback in the sparse indexer (aa7e5f011b)
+- fix: route the k=64/128 persistent-topk arms through the dtype wrapper after the upstream launcher split (0f03b25c08)
+- fix: restore the SM80 triton fallback + DeepGEMM gate in the sparse indexer after the upstream restructure (aeec9d9df2)
+- Revert "Merge branch 'perf/eagle-k0-lifecycle' into next" (9107e1fba5)
+- Revert "fix(spec): eagle K=0 resume re-growth must reach the runner's block table" (183ef23a1a)
+- Revert "fix(spec): eagle K=0 resume rebuilds runner rows via the resumed channel" (9b31b8d4e8)
+- Revert "perf(sched): eagle K=0 hold engages only on all-decode steps" (b794cff8a5)
+- Revert "perf(runner): batch the eagle K=0 stash capture to one clone set per step" (5d4cfa746a)
+- Revert "perf(runner): prune the eagle K=0 stash only when the live set changes" (008d530292)
+- Revert "docs: correct claims in 7e67d27777/9570e9e0f5/9b97d10d0b (the stash-clone chase)" (ca70f82b4f)
+- docs: correct claims in 7e67d27777/9570e9e0f5/9b97d10d0b (the stash-clone chase) (91c751dbac)
+- docs: regenerate DELTA.md for the current delta (9d2030103a)
+- perf(runner): prune the eagle K=0 stash only when the live set changes (9b97d10d0b)
+- perf(runner): batch the eagle K=0 stash capture to one clone set per step (9570e9e0f5)
+- perf(sched): eagle K=0 hold engages only on all-decode steps (7e67d27777)
 - fix(spec): eagle K=0 resume rebuilds runner rows via the resumed channel (72e2f45c01)
 - fix(spec): eagle K=0 resume re-growth must reach the runner's block table (6d6c7e8f2e)
 - docs: regenerate DELTA.md for the current delta (b017bd1ce9)

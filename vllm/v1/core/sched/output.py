@@ -315,21 +315,6 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
-    # Eagle K=0 lifecycle resume: request id -> catch-up gap (tokens whose
-    # draft-group KV was held back during the K=0 stretch). Non-empty on the
-    # one-step pause step where the runner replays the drafter catch-up
-    # prefill before speculation resumes.
-    eagle_catchup_req_ids: dict[str, int] = field(default_factory=dict)
-
-    # Eagle K=0 lifecycle: the batch is holding at a K=0 tier — the runner
-    # skips the drafter sync prefill and stashes the per-step propose inputs
-    # for the catch-up replay at the resume.
-    eagle_k0_hold: bool = False
-
-    # Deprecated: cascade attention has been removed, so this is always empty.
-    # Kept for out-of-tree schedulers and workers.
-    num_common_prefix_blocks: list[int] = field(default_factory=list)
-
     # Whether no scheduled request can use the drafts proposed after this step
     # (non-final prefill chunks, or requests sure to reach max_tokens), so the
     # drafter can skip proposing them.
@@ -355,8 +340,3 @@ class GrammarOutput:
     structured_output_request_ids: list[str]
     # Bitmask ordered as structured_output_request_ids.
     grammar_bitmask: "npt.NDArray[np.int32]"
-    # Per request, ordered as structured_output_request_ids: how many leading
-    # drafts the bitmask constrained. `grammar_bitmask` fills every row after
-    # the first -1 placeholder with the all-permissive `_full_mask`, so drafts
-    # from this index on must not be accepted. None invalidates every draft.
-    num_acceptable_drafts: list[int] | None = None
