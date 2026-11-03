@@ -49,7 +49,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.ops.mqa_logits_triton import fp8_mqa_logits_triton
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -1006,25 +1009,40 @@ def sparse_attn_indexer(
                 max_model_len,
             )
         else:
-            padded_q_scale, decode_weights = mqa_logits_mx_inputs(
-                padded_q_quant_cast, padded_q_scale, weights[:num_padded_tokens]
-            )
-            logits = fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                decode_weights,
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                indices=decode_metadata.indices,
-            )
-            # Keeping bf16 halves top-k/candidate reads. SM100 decode is varlen:
-            # one context length per row.
-            if dcp_world_size != 1 or not get_indexer_topk(
-                topk_backend
-            ).takes_bf16_logits(logits, topk_tokens, logits.shape[0]):
-                logits = as_fp32_logits(logits, seq_lens.view(-1))
+            if use_deep_gemm:
+                padded_q_scale, decode_weights = mqa_logits_mx_inputs(
+                    padded_q_quant_cast, padded_q_scale, weights[:num_padded_tokens]
+                )
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    decode_weights,
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    indices=decode_metadata.indices,
+                )
+                # Keeping bf16 halves top-k/candidate reads. SM100 decode is varlen:
+                # one context length per row.
+                if dcp_world_size != 1 or not get_indexer_topk(
+                    topk_backend
+                ).takes_bf16_logits(logits, topk_tokens, logits.shape[0]):
+                    logits = as_fp32_logits(logits, seq_lens.view(-1))
+            else:
+                # SM80/SM121 Triton fallback. Downstream topk reads only up to
+                # `seq_lens`, so size the buffer to the active batch max rather
+                # than the configured model max.
+                active_max_model_len = attn_metadata_narrowed.max_seq_len
+                logits = fp8_paged_mqa_logits_triton(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    max_model_len=active_max_model_len,
+                    clean_logits=False,
+                )
         num_rows = logits.shape[0]
         if candidate_blocks is not None:
             # Two-level selection (v4.1) on the decode logits; columns are
