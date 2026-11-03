@@ -1,10 +1,10 @@
 <!-- markdownlint-disable MD060 -->
 # Delta vs upstream vLLM
 
-`main` = upstream `main` (nightly merge) + the commits below: 34 source commits (70 files changed, 4331 insertions(+), 346 deletions(-)).
+`main` = upstream `main` (nightly merge) + the commits below: 35 source commits (70 files changed, 4368 insertions(+), 365 deletions(-)).
 
-Diff base: upstream commit `28dd9c36b5` — the tip this tree last merged from origin. Reproduce at this commit with:
-`git log --no-merges 28dd9c36b5..85967a26a7 -- vllm/ csrc/` and `git diff --stat 28dd9c36b5..85967a26a7 -- vllm/ csrc/`.
+Diff base: upstream commit `190df0b900` — the tip this tree last merged from origin. Reproduce at this commit with:
+`git log --no-merges 190df0b900..45dc2bcd02 -- vllm/ csrc/` and `git diff --stat 190df0b900..45dc2bcd02 -- vllm/ csrc/`.
 
 Areas upstream does not ship for this hardware are what this distribution exists to carry; general fixes are contributed upstream first (see README). Regenerated automatically by the nightly integrate.
 
@@ -12,8 +12,8 @@ Areas upstream does not ship for this hardware are what this distribution exists
 |---|---|
 | general fixes | 13 |
 | spec-decode fixes | 11 |
+| sparse attention (TRITON_MLA_SPARSE) | 3 |
 | model bring-up (GLM5Next / Qwen4Exp / DSV41) | 3 |
-| sparse attention (TRITON_MLA_SPARSE) | 2 |
 | fork delta (squash: spec-decode fixes + KV-cache / offload fixes) | 1 |
 | KV-cache / offload fixes | 1 |
 | fork delta (squash: sparse attention (TRITON_MLA_SPARSE) + KV-cache / offload fixes) | 1 |
@@ -22,6 +22,7 @@ Areas upstream does not ship for this hardware are what this distribution exists
 
 <details><summary>Full commit list</summary>
 
+- fix: restore the decode-path SM80 triton fallback in the sparse indexer (aa7e5f011b)
 - fix: route the k=64/128 persistent-topk arms through the dtype wrapper after the upstream launcher split (0f03b25c08)
 - fix: restore the SM80 triton fallback + DeepGEMM gate in the sparse indexer after the upstream restructure (aeec9d9df2)
 - Revert "Merge branch 'perf/eagle-k0-lifecycle' into next" (9107e1fba5)
