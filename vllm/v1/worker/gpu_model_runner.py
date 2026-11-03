@@ -5187,7 +5187,7 @@ class GPUModelRunner(
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
         if (
-            is_breakable_cudagraph_enabled()
+            is_breakable_cudagraph_enabled(self.vllm_config.compilation_config)
             and cudagraph_mode != CUDAGraphMode.NONE
             and not self.parallel_config.use_ubatching
         ):
