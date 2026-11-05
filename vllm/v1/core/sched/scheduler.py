@@ -357,6 +357,12 @@ class Scheduler(SchedulerInterface):
         # crossing (the born-null row shape) so the admission check
         # prices the freed blocks automatically.
         self._slot_release = envs.VLLM_MAMBA_K0_SLOT_RELEASE and self._priced_admission
+        if envs.VLLM_MAMBA_K0_SLOT_RELEASE and not self._slot_release:
+            logger.warning(
+                "VLLM_MAMBA_K0_SLOT_RELEASE has no effect without "
+                "VLLM_MAMBA_PRICED_ADMISSION (and a mamba spec-tier "
+                "table); ignoring it."
+            )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -1201,12 +1207,11 @@ class Scheduler(SchedulerInterface):
                     and not spec_tier_fits
                 ):
                     # No tier fits the formed batch's end-state footprint
-                    # (the tier-loyal fallback): a waiting row may still
-                    # admit only while the GROWN batch fits some tier.
-                    # The per-row trickle past the verdict oversubscribed
-                    # the shared pool (the c16@56K engine kill: chunk-sized
-                    # per-row footprints kept fitting the current free,
-                    # the pool ran to zero with end-state growth pending).
+                    # (tier-loyal fallback): a waiting row may still admit
+                    # only while the GROWN batch fits some tier. The per-row
+                    # trickle past the verdict oversubscribed the shared
+                    # pool (the c16@56K engine kill: chunk-sized footprints
+                    # kept fitting the current free, the pool ran to zero).
                     grown = self.running + [request]
                     tier = spec_tier_lookup[min(len(grown), len(spec_tier_lookup) - 1)]
                     fits = self.kv_cache_manager.spec_batch_fits_tier(grown, tier)
