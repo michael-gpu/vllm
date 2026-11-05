@@ -356,7 +356,7 @@ class Scheduler(SchedulerInterface):
         # Release the running rows' idle speculative windows at the K=0
         # crossing (the born-null row shape) so the admission check
         # prices the freed blocks automatically.
-        self._slot_release = envs.VLLM_MAMBA_K0_SLOT_RELEASE and self._priced_admission
+        self._slot_release = envs.VLLM_MAMBA_K0_SLOT_RELEASE
         if envs.VLLM_MAMBA_K0_SLOT_RELEASE and not self._slot_release:
             logger.warning(
                 "VLLM_MAMBA_K0_SLOT_RELEASE has no effect without "
@@ -840,7 +840,9 @@ class Scheduler(SchedulerInterface):
         step_tier = 0
         spec_tier_fits = False
         formed_batch: list[Request] = []
-        if self._priced_admission and spec_tier_lookup is not None:
+        if (self._priced_admission or self._slot_release) and (
+            spec_tier_lookup is not None
+        ):
             batch_slots = max(self.scheduler_config.max_num_seqs - len(self.running), 0)
             formed_waiting = (list(self.kv_holding_waiting) + list(self.waiting))[
                 :batch_slots
@@ -855,28 +857,35 @@ class Scheduler(SchedulerInterface):
             formed_count = min(len(formed_batch), len(spec_tier_lookup) - 1)
             table_tier = spec_tier_lookup[formed_count]
             step_tier = table_tier
-            while step_tier > 0 and not self.kv_cache_manager.spec_batch_fits_tier(
-                formed_batch, step_tier
-            ):
-                step_tier -= 1
-            if step_tier > 0 or self.kv_cache_manager.spec_batch_fits_tier(
-                formed_batch, 0
-            ):
-                spec_tier_fits = True
-            elif table_tier > 0:
-                # No tier fits the formed batch: ADMISSIONS stall (the
-                # per-row bottom-out check below prices each candidate
-                # against the batch's end-state — the tier-loyal gate that
-                # prevents the c16@56K over-admission kill). The RUNNING
-                # rows are not held hostage to the table tier: they drain
-                # at their pinned tier (0) — the release frees their idle
-                # windows, the per-chunk graceful check gates their growth,
-                # and the KV valve preempts at pressure. Locking the step
-                # at the table tier deadlocked the batch (rows pinned at
-                # tier 0 could neither promote — verdict-gated — nor
-                # release — step-tier-gated; the 2026-11-05 wedge).
-                step_tier = 0
-            if not spec_tier_fits and self.running:
+            if self._priced_admission:
+                # The priced arm projects the formed batch's end-state and
+                # demotes until it fits (the bottom-out drains at the pinned
+                # tier). The stripped arm (slot release without priced
+                # admission) takes the table tier directly: the release and
+                # the promotion price themselves against the free pool, and
+                # admission safety is the reserve flag's job.
+                while step_tier > 0 and not self.kv_cache_manager.spec_batch_fits_tier(
+                    formed_batch, step_tier
+                ):
+                    step_tier -= 1
+                if step_tier > 0 or self.kv_cache_manager.spec_batch_fits_tier(
+                    formed_batch, 0
+                ):
+                    spec_tier_fits = True
+                elif table_tier > 0:
+                    # No tier fits the formed batch: ADMISSIONS stall (the
+                    # per-row bottom-out check below prices each candidate
+                    # against the batch's end-state — the tier-loyal gate that
+                    # prevents the c16@56K over-admission kill). The RUNNING
+                    # rows are not held hostage to the table tier: they drain
+                    # at their pinned tier (0) — the release frees their idle
+                    # windows, the per-chunk graceful check gates their growth,
+                    # and the KV valve preempts at pressure. Locking the step
+                    # at the table tier deadlocked the batch (rows pinned at
+                    # tier 0 could neither promote — verdict-gated — nor
+                    # release — step-tier-gated; the 2026-11-05 wedge).
+                    step_tier = 0
+            if self._priced_admission and not spec_tier_fits and self.running:
                 self._idle_step_diag = getattr(self, "_idle_step_diag", 0) + 1
                 if self._idle_step_diag % 50 == 1:
                     logger.warning(
@@ -1142,9 +1151,8 @@ class Scheduler(SchedulerInterface):
             # the retry: at the bottom-out the refill would consume blocks
             # the all-pool check refused to promise.
             if (
-                self._priced_admission
-                and step_tier > 0
-                and spec_tier_fits
+                step_tier > 0
+                and (spec_tier_fits or not self._priced_admission)
                 and not (request.is_prefill_chunk)
             ):
                 self.kv_cache_manager.promote_spec_blocks(
