@@ -870,6 +870,20 @@ class Scheduler(SchedulerInterface):
                 # fitting tier refused is the over-admission the all-pool
                 # check exists to prevent (the 68K c14 engine kill).
                 step_tier = table_tier
+            if not spec_tier_fits and self.running:
+                self._idle_step_diag = getattr(self, "_idle_step_diag", 0) + 1
+                if self._idle_step_diag % 50 == 1:
+                    logger.warning(
+                        "priced-admission idle step: formed=%d table_tier=%d "
+                        "step_tier=%d fits=%s running=%d waiting=%d free=%d",
+                        len(formed_batch),
+                        table_tier,
+                        step_tier,
+                        spec_tier_fits,
+                        len(self.running),
+                        len(self.waiting),
+                        self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                    )
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
