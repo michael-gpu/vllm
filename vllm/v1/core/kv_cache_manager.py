@@ -628,6 +628,11 @@ class KVCacheManager:
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
+        self._last_chunk_check = (
+            num_blocks_to_allocate,
+            available_blocks,
+            request.request_id,
+        )
         if required_blocks > available_blocks:
             if count_failure:
                 self._log_admission_failure(
@@ -769,6 +774,16 @@ class KVCacheManager:
             num_tokens_need_slot,
             getattr(self, "_last_fit_check", None),
         )
+        check_state = getattr(self, "_last_chunk_check", None)
+        if check_state is not None:
+            logger.error(
+                "allocation failure check-state: check_req=%s check_free=%s "
+                "placement_free=%s check_req_id=%s",
+                check_state[0],
+                check_state[1],
+                self.block_pool.get_num_free_blocks(),
+                check_state[2],
+            )
         for manager in self.coordinator.single_type_managers:
             blocks = manager.req_to_blocks.get(request_id)
             logger.error(
