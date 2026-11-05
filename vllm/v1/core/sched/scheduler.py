@@ -885,6 +885,19 @@ class Scheduler(SchedulerInterface):
                     # tier 0 could neither promote — verdict-gated — nor
                     # release — step-tier-gated; the 2026-11-05 wedge).
                     step_tier = 0
+            else:
+                # One-way release: a released row's window is gone until the
+                # row completes, so the batch stays at K=0 while any released
+                # row runs. No promotion — the pin-then-lift rebuild contract
+                # is unsound (the 2026-11-05 wedge and the num_logits assert).
+                # The cost is spec decode below the K=0 crossing for the
+                # rows sharing the batch with a released row; the reserve
+                # flag and the KV valve carry admission safety.
+                if any(
+                    self.kv_cache_manager.is_spec_released(r.request_id)
+                    for r in self.running
+                ):
+                    step_tier = 0
             if self._priced_admission and not spec_tier_fits and self.running:
                 self._idle_step_diag = getattr(self, "_idle_step_diag", 0) + 1
                 if self._idle_step_diag % 50 == 1:
@@ -1151,8 +1164,9 @@ class Scheduler(SchedulerInterface):
             # the retry: at the bottom-out the refill would consume blocks
             # the all-pool check refused to promise.
             if (
-                step_tier > 0
-                and (spec_tier_fits or not self._priced_admission)
+                self._priced_admission
+                and step_tier > 0
+                and spec_tier_fits
                 and not (request.is_prefill_chunk)
             ):
                 self.kv_cache_manager.promote_spec_blocks(
