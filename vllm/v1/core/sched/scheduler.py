@@ -864,12 +864,18 @@ class Scheduler(SchedulerInterface):
             ):
                 spec_tier_fits = True
             elif table_tier > 0:
-                # No tier fits the formed batch: the table tier stands and
-                # admission stalls (tier-loyal — the old behavior). The
-                # per-row retry is gated off below: admitting rows that a
-                # fitting tier refused is the over-admission the all-pool
-                # check exists to prevent (the 68K c14 engine kill).
-                step_tier = table_tier
+                # No tier fits the formed batch: ADMISSIONS stall (the
+                # per-row bottom-out check below prices each candidate
+                # against the batch's end-state — the tier-loyal gate that
+                # prevents the c16@56K over-admission kill). The RUNNING
+                # rows are not held hostage to the table tier: they drain
+                # at their pinned tier (0) — the release frees their idle
+                # windows, the per-chunk graceful check gates their growth,
+                # and the KV valve preempts at pressure. Locking the step
+                # at the table tier deadlocked the batch (rows pinned at
+                # tier 0 could neither promote — verdict-gated — nor
+                # release — step-tier-gated; the 2026-11-05 wedge).
+                step_tier = 0
             if not spec_tier_fits and self.running:
                 self._idle_step_diag = getattr(self, "_idle_step_diag", 0) + 1
                 if self._idle_step_diag % 50 == 1:
