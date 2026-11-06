@@ -9157,12 +9157,15 @@ def test_uniform_tier_boundary_recovers_at_k0(monkeypatch):
         assert kv_cache_manager.is_spec_released(req.request_id)
 
 
-def test_uniform_tier_attention_bound_no_demotion(monkeypatch):
+def test_uniform_tier_attention_bound_demotes_at_bottom_out(monkeypatch):
     """Formed-batch uniform tier, attention-bound long prompts: when NO
-    tier fits the formed batch's end-state (the attention pool binds, not
-    the mamba pool), the step tier is NOT demoted — the table tier stands
-    and admission stalls tier-loyally. A mamba-only fit check would
-    demote to K=0 and over-admit rows the attention pool cannot hold."""
+    tier fits the formed batch's end-state (the shared pool binds, not
+    the mamba tier alone), the step tier demotes to K=0 — the 2026-11-05
+    wedge fix: locking the step at the table tier left rows pinned at
+    tier 0 unable to promote (verdict-gated) or release (step-tier-gated).
+    Admission still prices the grown batch's END-STATE at the demoted
+    tier, so the demotion admits exactly the rows whose end-states fit —
+    no row past the verdict."""
     scheduler = _hybrid_priced_scheduler(
         monkeypatch, num_blocks=37, schedule_table=[(1, 128, 2)]
     )
@@ -9174,25 +9177,26 @@ def test_uniform_tier_attention_bound_no_demotion(monkeypatch):
     output = scheduler.schedule()
 
     # 16 rows need 128 blocks at the K=2 end-state and 96 at K=0 against
-    # a 37-block pool: no tier fits, so the table tier (K=2) stands. The
-    # head rows admit tier-loyally while their END-STATE footprint fits
-    # the free pool alongside the running rows' remaining growth (5
-    # rows) and the tail queues — the old stall behavior, with no rows
-    # demoted behind the scheduler's back and no row admitted past the
-    # verdict the pool cannot grow into.
-    assert set(output.num_scheduled_tokens) == {req.request_id for req in reqs[:5]}
-    assert output.num_spec_tokens_to_schedule == 2
-    for req in reqs:
+    # a 37-block pool: no tier fits, so the step tier demotes to K=0 and
+    # admission prices the grown batch at that tier — 7 rows' end-states
+    # (attention + null-window mamba) fit the pool, the 8th row's does
+    # not and stalls. The admitted rows are born pinned at the K=0 tier.
+    assert set(output.num_scheduled_tokens) == {req.request_id for req in reqs[:7]}
+    assert output.num_spec_tokens_to_schedule == 0
+    for req in reqs[:7]:
+        assert kv_cache_manager.is_spec_released(req.request_id)
+    for req in reqs[7:]:
         assert not kv_cache_manager.is_spec_released(req.request_id)
 
 
-def test_uniform_tier_bottom_out_refuses_retry(monkeypatch):
-    """When no tier fits the formed batch (the bottom-out), the per-row
-    priced retry is gated off: a row the table tier cannot hold STALLS
-    instead of admitting at the K=0 tier. The ungated retry over-admits
-    rows past the all-pool verdict — the 68K c14 engine kill (the
-    attention growth of retry-admitted rows exhausted the pool the
-    tier-loyal stall would have protected)."""
+def test_uniform_tier_bottom_out_prices_at_demoted_tier(monkeypatch):
+    """When no tier fits the formed batch (the bottom-out), the step
+    tier demotes to K=0 and the per-row admission prices the grown
+    batch's END-STATE at that tier: a row is admitted only while the
+    grown batch's end-state fits the free pool alongside the running
+    rows' remaining growth. The unsound projection priced only the
+    waiting row's prompt, admitted it past the verdict, and the running
+    row's decode growth exhausted the pool — the c16@56K engine kill."""
     scheduler = _mamba_priced_scheduler(
         monkeypatch, num_blocks=6, schedule_table=[(1, 128, 2)]
     )
@@ -9204,12 +9208,16 @@ def test_uniform_tier_bottom_out_refuses_retry(monkeypatch):
     output = scheduler.schedule()
 
     # 6 rows need 18 blocks at K>0 and 6 at K=0 against 5 free: no tier
-    # fits, the table tier (K=2) stands. The head row admits tier-loyally;
-    # the next row's K=2 footprint fails and its K=0 footprint WOULD fit
-    # the leftover — the gated retry refuses it and the admission stalls.
-    assert set(output.num_scheduled_tokens) == {reqs[0].request_id}
-    assert output.num_spec_tokens_to_schedule == 2
-    for req in reqs:
+    # fits, the step tier demotes to K=0. Admission prices the grown
+    # batch at that tier: two rows' end-states fit the free pool (with
+    # the admission watermark), the third row's grown end-state does not
+    # — it stalls instead of admitting past the verdict.
+    assert set(output.num_scheduled_tokens) == {
+        reqs[0].request_id,
+        reqs[1].request_id,
+    }
+    assert output.num_spec_tokens_to_schedule == 0
+    for req in reqs[2:]:
         assert not kv_cache_manager.is_spec_released(req.request_id)
 
 
@@ -9242,11 +9250,12 @@ def test_uniform_tier_running_growth_gates_admission(monkeypatch):
     output = scheduler.schedule()
     # req_a's remaining attention growth (5 blocks to its 128-token end
     # state) plus req_b's end-state (8 attention + 4 mamba) exceed the
-    # free pool: no tier fits, the table tier stands, and req_b's
-    # end-state does not fit alongside the growth — it stalls instead of
+    # free pool: no tier fits, the step tier demotes to K=0 (the wedge
+    # fix — the running row drains there), and req_b's end-state does
+    # not fit alongside the growth at any tier — it stalls instead of
     # admitting past the verdict, leaving req_a's decode growth funded.
     assert set(output.num_scheduled_tokens) == {req_a.request_id}
-    assert output.num_spec_tokens_to_schedule == 2
+    assert output.num_spec_tokens_to_schedule == 0
     assert not kv_cache_manager.is_spec_released(req_b.request_id)
     assert req_b.request_id not in mamba_manager.req_to_blocks
     assert req_b.request_id not in attn_manager.req_to_blocks
