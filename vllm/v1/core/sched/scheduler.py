@@ -1307,6 +1307,9 @@ class Scheduler(SchedulerInterface):
                         tier -= 1
                         fits = self.kv_cache_manager.spec_batch_fits_tier(grown, tier)
                     if not fits:
+                        # An admission stall on blocks: the demand gate opens
+                        # for it too.
+                        self._admission_block_stall = True
                         break
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
@@ -1690,7 +1693,9 @@ class Scheduler(SchedulerInterface):
                         # remaining growth (their chunk demand comes first):
                         # a row admitted past the all-pool verdict grows into
                         # blocks the check refused to promise. It stalls until
-                        # completions free the pool.
+                        # completions free the pool. This is an admission
+                        # stall on blocks: the demand gate opens for it too.
+                        self._admission_block_stall = True
                         break
                     if priceable and prior_tier == 0:
                         self.kv_cache_manager.mark_spec_admission_tier0(request_id)
