@@ -838,13 +838,12 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
-        # Formed-batch uniform-tier rule: the spec tier for this step is
-        # the dynamic table's answer for the batch being FORMED (running
-        # + waiting), demoted until that batch's end-state fits every
-        # constrained pool. One tier for the whole step — every row runs
-        # at the same tier, and the tier rises/falls freely between
-        # steps. If no tier fits, the step demotes to K=0 and admission
-        # prices the grown batch's end-state at that tier.
+        # Formed-batch uniform-tier rule: the step's spec tier is the
+        # table's answer for the batch being FORMED (running + waiting),
+        # demoted until that batch's end-state fits every constrained
+        # pool. One tier for the whole step; the tier rises and falls
+        # freely between steps. If no tier fits, the step demotes to K=0
+        # and admission prices the grown batch's end-state at that tier.
         spec_tier_lookup = self.dynamic_sd_lookup
         step_tier = 0
         spec_tier_fits = False
@@ -883,27 +882,20 @@ class Scheduler(SchedulerInterface):
                 ):
                     spec_tier_fits = True
                 elif table_tier > 0:
-                    # No tier fits the formed batch: ADMISSIONS stall (the
-                    # per-row bottom-out check below prices each candidate
-                    # against the batch's end-state). The RUNNING rows are
-                    # not held hostage to the table tier: they drain at
-                    # their pinned tier (0) — the release frees their idle
-                    # windows, the per-chunk graceful check gates their
-                    # growth, and the KV valve preempts at pressure.
-                    # Locking the step at the table tier deadlocks the
-                    # batch (rows pinned at tier 0 could neither promote —
-                    # verdict-gated — nor release — step-tier-gated).
+                    # No tier fits: ADMISSIONS stall (the per-row bottom-out
+                    # check below prices each candidate against the batch's
+                    # end-state); the RUNNING rows drain at their pinned tier
+                    # (0) — release frees their idle windows, the graceful
+                    # check gates growth, the valve preempts. Locking the
+                    # step at the table tier deadlocks pinned rows instead.
                     step_tier = 0
             else:
-                # Promote BEFORE the step tier is finalized: a promotion
-                # attempted after the pin demoted the tier could never
-                # fire (its gate is step_tier > 0). The pin is pool
-                # pressure, not a life sentence: when the table's tier
-                # rises and the formed batch's end-state fits it (the
-                # verdict prices every released row's window plus the
-                # watermark), refill and unpin the released rows; demote
-                # to K=0 only if pinned rows remain — deadlock is
-                # structurally impossible.
+                # Promote BEFORE the tier is finalized: after the pin
+                # demotes it, the promotion gate (step_tier > 0) can never
+                # fire. The pin is pool pressure, not a life sentence: on a
+                # risen tier whose formed batch fits (the verdict prices
+                # every released row's window plus the watermark), refill
+                # and unpin; demote to K=0 only if pinned rows remain.
                 if table_tier > 0:
                     released_running = [
                         r
@@ -997,16 +989,12 @@ class Scheduler(SchedulerInterface):
             ):
                 request.spec_token_ids = []
 
-            # At a K=0 crossing the step schedules no drafts either:
-            # clear the staged placeholder drafts BEFORE num_new_tokens
-            # is computed. They count toward num_tokens_with_spec, and
-            # clearing them only after the token count would schedule
-            # phantom draft rows that never produce output — the
-            # computed-token bookkeeping drifts until the next step's
-            # schedule collapses under the runner's num_logits assert.
-            # The window block swap itself stays after allocate_slots,
-            # so this step's boundary advance cannot refill the
-            # just-nulled window.
+            # At a K=0 crossing clear the staged placeholder drafts BEFORE
+            # num_new_tokens is computed: counted afterward, they schedule
+            # phantom draft rows that never produce output and the
+            # computed-token bookkeeping drifts until the runner's
+            # num_logits assert fires. The window swap itself stays after
+            # allocate_slots so the boundary advance cannot refill it.
             if (
                 self._slot_release
                 and step_tier == 0
@@ -1185,18 +1173,12 @@ class Scheduler(SchedulerInterface):
                 request, request.num_computed_tokens, num_new_tokens
             )
 
-            # K=0 slot release: while the step's uniform tier schedules
-            # K=0, a running row's speculative window is an idle hedge —
-            # swap it for null slots (the born-null row shape) and return
-            # the blocks to the pool, where the admission check prices
-            # them automatically. Only decode-phase rows release: the
-            # window is idle draft state until the row decodes. This runs
-            # after allocate_slots so the step's boundary advance cannot
-            # refill the just-nulled window positions; the staged draft
-            # clear for this step already happened before num_new_tokens.
-            # Demand-gated: the release fires only when admissions
-            # stalled on blocks (the previous step's verdict) — pool
-            # pressure, not the tier alone.
+            # K=0 slot release: at a K=0 step a running row's window is an
+            # idle hedge — swap it for null slots and return the blocks to
+            # the pool. Decode-phase rows only; runs after allocate_slots
+            # so the boundary advance cannot refill the just-nulled window.
+            # Demand-gated: fires only after admissions stalled on blocks
+            # (the previous step's verdict) — pool pressure, not the tier.
             if (
                 self._slot_release
                 and step_tier == 0
@@ -1210,15 +1192,12 @@ class Scheduler(SchedulerInterface):
                 request.spec_token_ids = []
                 logger.info("K0 slot release: %s window freed", request_id)
 
-            # Priced promotion: while the step's uniform tier schedules
-            # K>0, a row whose window is null row slots is refilled to the
-            # full spec tier when the pool fits it (plus the admission
-            # watermark). The tier — not a per-request pin — governs the
-            # step; the price — not the count — lifts the row. Only
-            # decode-phase rows promote: the window is idle draft state
-            # until the row decodes. Gated on the step-level verdict like
-            # the retry: at the bottom-out the refill would consume blocks
-            # the all-pool check refused to promise.
+            # Priced promotion: at a K>0 step, a row with null window slots
+            # refills to the full spec tier when the pool fits it plus the
+            # admission watermark. The tier governs the step; the price
+            # lifts the row. Decode-phase rows only. Gated on the step-level
+            # verdict: at the bottom-out the refill would consume blocks the
+            # all-pool check refused to promise.
             if (
                 self._priced_admission
                 and step_tier > 0
@@ -1687,14 +1666,12 @@ class Scheduler(SchedulerInterface):
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
 
-                # Formed-batch uniform tier: the step's tier is the prior
-                # for the tier this request joins — every row in the step
-                # runs at the same tier, demoted (once, at the step level)
-                # until the formed batch's end-state fits every constrained
-                # pool. At a K=0 step tier the window is born as null row
-                # slots; at a K>0 step tier a footprint failure retries at
-                # the K=0 tier — degrade the optional state at admission
-                # before stalling.
+                # Formed-batch uniform tier: every row in the step runs at
+                # the same tier, demoted at the step level until the formed
+                # batch's end-state fits. At a K=0 step tier the window is
+                # born as null row slots; at a K>0 tier a footprint failure
+                # retries at the K=0 tier — degrade the optional state at
+                # admission before stalling.
                 priceable = False
                 prior_tier = 0
                 if self._priced_admission:
@@ -1708,14 +1685,12 @@ class Scheduler(SchedulerInterface):
                             [*self.running, request], prior_tier
                         )
                     ):
-                        # The bottom-out's tier-loyal admission prices the
-                        # row's END-STATE footprint against the free pool
-                        # MINUS the running rows' remaining growth (their
-                        # chunk-allocation demand comes first): a row
-                        # admitted past the all-pool verdict grows into
-                        # blocks the check refused to promise — a
-                        # long-generation pool exhaustion. The row stalls
-                        # until completions free the pool.
+                        # The bottom-out admission prices the row's END-STATE
+                        # against the free pool MINUS the running rows'
+                        # remaining growth (their chunk demand comes first):
+                        # a row admitted past the all-pool verdict grows into
+                        # blocks the check refused to promise. It stalls until
+                        # completions free the pool.
                         break
                     if priceable and prior_tier == 0:
                         self.kv_cache_manager.mark_spec_admission_tier0(request_id)
