@@ -1692,9 +1692,8 @@ class Scheduler(SchedulerInterface):
                         # against the free pool MINUS the running rows'
                         # remaining growth (their chunk demand comes first):
                         # a row admitted past the all-pool verdict grows into
-                        # blocks the check refused to promise. It stalls until
-                        # completions free the pool. This is an admission
-                        # stall on blocks: the demand gate opens for it too.
+                        # blocks the check refused to promise, stalling until
+                        # completions free the pool — the demand gate opens.
                         self._admission_block_stall = True
                         break
                     if priceable and prior_tier == 0:
