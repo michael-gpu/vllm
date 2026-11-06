@@ -924,6 +924,10 @@ class Scheduler(SchedulerInterface):
                                 reserve=self.kv_cache_manager.watermark_blocks,
                             ):
                                 promoted.append(r.request_id)
+                                logger.info(
+                                    "K0 slot promotion: %s window refilled",
+                                    r.request_id,
+                                )
                 if any(
                     self.kv_cache_manager.is_spec_released(r.request_id)
                     for r in self.running
