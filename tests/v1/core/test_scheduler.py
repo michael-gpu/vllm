@@ -9166,13 +9166,12 @@ def test_slot_release_demand_gates_running_window(monkeypatch):
 
 
 def test_slot_release_promotes_when_tier_rises(monkeypatch):
-    """The walk-down killer: a released row is not a life sentence. When
-    the formed batch drains and the table's tier rises, the released row
-    promotes BEFORE the tier is finalized — the window refills with fresh
-    blocks, the pin lifts, and drafts resume. The old code promoted inside
-    the running loop after the pin had demoted the tier, so the promotion
-    gate (step_tier > 0) could never fire while a released row ran (the
-    2026-11-05 wedge): under homeostasis spec decode never returned."""
+    """A released row is not a life sentence: when the formed batch drains
+    and the table's tier rises, the released row promotes BEFORE the tier
+    is finalized — the window refills with fresh blocks, the pin lifts,
+    and drafts resume. A promotion attempted after the pin demoted the
+    tier could never fire (its gate is step_tier > 0): under homeostasis
+    spec decode would never return."""
     scheduler = _mamba_slot_release_scheduler(
         monkeypatch, num_blocks=5, schedule_table=[(1, 1, 2), (2, 16, 0)]
     )
@@ -9222,11 +9221,11 @@ def test_slot_release_promotes_when_tier_rises(monkeypatch):
 
 
 def test_slot_release_promotion_holds_when_batch_does_not_fit(monkeypatch):
-    """The revival's structural guard: when the formed batch's end-state
-    does not fit the risen tier, the released row stays pinned and the
-    step degrades to K=0 — the batch keeps scheduling and admissions keep
-    flowing (born-null). The old tier-loyal wedge (rows pinned at tier 0
-    that could neither promote nor release) is structurally impossible."""
+    """Structural guard: when the formed batch's end-state does not fit
+    the risen tier, the released row stays pinned and the step degrades
+    to K=0 — the batch keeps scheduling and admissions keep flowing
+    (born-null). A state where pinned rows could neither promote nor
+    release is structurally impossible."""
     scheduler = _mamba_slot_release_scheduler(
         monkeypatch,
         num_blocks=7,
@@ -9387,9 +9386,9 @@ def test_uniform_tier_boundary_recovers_at_k0(monkeypatch):
 def test_uniform_tier_attention_bound_demotes_at_bottom_out(monkeypatch):
     """Formed-batch uniform tier, attention-bound long prompts: when NO
     tier fits the formed batch's end-state (the shared pool binds, not
-    the mamba tier alone), the step tier demotes to K=0 — the 2026-11-05
-    wedge fix: locking the step at the table tier left rows pinned at
-    tier 0 unable to promote (verdict-gated) or release (step-tier-gated).
+    the mamba tier alone), the step tier demotes to K=0 — locking the
+    step at the table tier instead would leave rows pinned at tier 0
+    unable to promote (verdict-gated) or release (step-tier-gated).
     Admission still prices the grown batch's END-STATE at the demoted
     tier, so the demotion admits exactly the rows whose end-states fit —
     no row past the verdict."""
@@ -9421,9 +9420,9 @@ def test_uniform_tier_bottom_out_prices_at_demoted_tier(monkeypatch):
     tier demotes to K=0 and the per-row admission prices the grown
     batch's END-STATE at that tier: a row is admitted only while the
     grown batch's end-state fits the free pool alongside the running
-    rows' remaining growth. The unsound projection priced only the
-    waiting row's prompt, admitted it past the verdict, and the running
-    row's decode growth exhausted the pool — the c16@56K engine kill."""
+    rows' remaining growth. A projection that priced only the waiting
+    row's prompt admits past the verdict, and the running row's decode
+    growth then exhausts the pool."""
     scheduler = _mamba_priced_scheduler(
         monkeypatch, num_blocks=6, schedule_table=[(1, 128, 2)]
     )
@@ -9449,13 +9448,12 @@ def test_uniform_tier_bottom_out_prices_at_demoted_tier(monkeypatch):
 
 
 def test_uniform_tier_running_growth_gates_admission(monkeypatch):
-    """The 68K c14 engine-kill shape: the running row's remaining
-    end-state growth (its generation cap) is reserved in the all-pool
-    check, and at the bottom-out a waiting row is admitted only when its
-    end-state fits alongside that growth. The unsound projection priced
-    only the waiting row's prompt, admitted it past the verdict, and the
-    running row's decode growth exhausted the pool the tier-loyal stall
-    exists to prevent."""
+    """The running row's remaining end-state growth (its generation cap)
+    is reserved in the all-pool check, and at the bottom-out a waiting
+    row is admitted only when its end-state fits alongside that growth.
+    A projection that priced only the waiting row's prompt admits past
+    the verdict, and the running row's decode growth then exhausts the
+    pool the tier-loyal stall exists to prevent."""
     scheduler = _hybrid_priced_scheduler(
         monkeypatch, num_blocks=16, schedule_table=[(1, 128, 2)]
     )
@@ -9477,8 +9475,8 @@ def test_uniform_tier_running_growth_gates_admission(monkeypatch):
     output = scheduler.schedule()
     # req_a's remaining attention growth (5 blocks to its 128-token end
     # state) plus req_b's end-state (8 attention + 4 mamba) exceed the
-    # free pool: no tier fits, the step tier demotes to K=0 (the wedge
-    # fix — the running row drains there), and req_b's end-state does
+    # free pool: no tier fits, the step tier demotes to K=0 (the running
+    # row drains there), and req_b's end-state does
     # not fit alongside the growth at any tier — it stalls instead of
     # admitting past the verdict, leaving req_a's decode growth funded.
     assert set(output.num_scheduled_tokens) == {req_a.request_id}
@@ -9492,11 +9490,11 @@ def test_uniform_tier_refusal_gates_admission(monkeypatch):
     """The batch-level refusal must gate ADMISSION itself: when no tier
     fits the formed batch's end-state footprint, a waiting row whose
     per-row footprint happens to fit the current free must still stall
-    once the grown batch no longer fits any tier. The ungated trickle
-    admitted rows past the verdict on the shared hybrid pool (the
-    c16@56K engine kill: chunk-sized per-row footprints kept fitting,
-    the pool ran to zero free with end-state growth pending, and a
-    running row's chunk allocation killed the engine)."""
+    once the grown batch no longer fits any tier. An ungated trickle
+    admits rows past the verdict on the shared hybrid pool: chunk-sized
+    per-row footprints keep fitting while the pool runs to zero free
+    with end-state growth pending, and a running row's chunk allocation
+    then fails inside the engine."""
     scheduler = _hybrid_priced_scheduler(
         monkeypatch,
         num_blocks=112,

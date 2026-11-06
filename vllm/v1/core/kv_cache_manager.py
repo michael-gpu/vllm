@@ -836,10 +836,11 @@ class KVCacheManager:
         kv-holding) reserve the remaining growth to it — their held
         blocks are already outside the free count, and the growth is the
         chunk-allocation demand the running loop will make on the pool
-        (the 68K c14 engine kill when unreserved). Each manager prices
-        its own footprint: token-proportional for attention-style groups,
-        the resident state set for the mamba align group. Managers
-        sharing one block pool are priced against it together."""
+        (unreserved growth is how long generations exhaust the pool).
+        Each manager prices its own footprint: token-proportional for
+        attention-style groups, the resident state set for the mamba
+        align group. Managers sharing one block pool are priced against
+        it together."""
         pools: dict[int, list[SingleTypeKVCacheManager]] = {}
         for manager in self.coordinator.single_type_managers:
             pools.setdefault(id(manager.block_pool), []).append(manager)

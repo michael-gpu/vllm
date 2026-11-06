@@ -357,8 +357,7 @@ class Scheduler(SchedulerInterface):
         # prices the freed blocks automatically. The K=0 crossing is a
         # spec-tier-table concept: without the table, step_tier never
         # leaves its inert 0 and a release would fire on every decode
-        # row while drafts keep flowing at the static K (the 2026-11-05
-        # num_logits assert).
+        # row while drafts keep flowing at the static K.
         self._slot_release = (
             envs.VLLM_MAMBA_K0_SLOT_RELEASE and self.dynamic_sd_lookup is not None
         )
@@ -844,8 +843,8 @@ class Scheduler(SchedulerInterface):
         # + waiting), demoted until that batch's end-state fits every
         # constrained pool. One tier for the whole step — every row runs
         # at the same tier, and the tier rises/falls freely between
-        # steps. If no tier fits, the table tier stands and admission
-        # stalls (tier-loyal — the old behavior).
+        # steps. If no tier fits, the step demotes to K=0 and admission
+        # prices the grown batch's end-state at that tier.
         spec_tier_lookup = self.dynamic_sd_lookup
         step_tier = 0
         spec_tier_fits = False
@@ -886,27 +885,25 @@ class Scheduler(SchedulerInterface):
                 elif table_tier > 0:
                     # No tier fits the formed batch: ADMISSIONS stall (the
                     # per-row bottom-out check below prices each candidate
-                    # against the batch's end-state — the tier-loyal gate that
-                    # prevents the c16@56K over-admission kill). The RUNNING
-                    # rows are not held hostage to the table tier: they drain
-                    # at their pinned tier (0) — the release frees their idle
-                    # windows, the per-chunk graceful check gates their growth,
-                    # and the KV valve preempts at pressure. Locking the step
-                    # at the table tier deadlocked the batch (rows pinned at
-                    # tier 0 could neither promote — verdict-gated — nor
-                    # release — step-tier-gated; the 2026-11-05 wedge).
+                    # against the batch's end-state). The RUNNING rows are
+                    # not held hostage to the table tier: they drain at
+                    # their pinned tier (0) — the release frees their idle
+                    # windows, the per-chunk graceful check gates their
+                    # growth, and the KV valve preempts at pressure.
+                    # Locking the step at the table tier deadlocks the
+                    # batch (rows pinned at tier 0 could neither promote —
+                    # verdict-gated — nor release — step-tier-gated).
                     step_tier = 0
             else:
-                # Promotion revival: promote BEFORE the step tier is
-                # finalized. The old code promoted inside the running loop
-                # after the pin had demoted the tier, so the promotion gate
-                # (step_tier > 0) could never fire while a released row ran
-                # — that ordering WAS the 2026-11-05 wedge. The pin is pool
-                # pressure, not a life sentence: when the table's tier rises
-                # and the formed batch's end-state fits it (the verdict
-                # prices every released row's window plus the watermark),
-                # refill and unpin the released rows; demote to K=0 only if
-                # pinned rows remain — deadlock is structurally impossible.
+                # Promote BEFORE the step tier is finalized: a promotion
+                # attempted after the pin demoted the tier could never
+                # fire (its gate is step_tier > 0). The pin is pool
+                # pressure, not a life sentence: when the table's tier
+                # rises and the formed batch's end-state fits it (the
+                # verdict prices every released row's window plus the
+                # watermark), refill and unpin the released rows; demote
+                # to K=0 only if pinned rows remain — deadlock is
+                # structurally impossible.
                 if table_tier > 0:
                     released_running = [
                         r
@@ -1006,10 +1003,10 @@ class Scheduler(SchedulerInterface):
             # clearing them only after the token count would schedule
             # phantom draft rows that never produce output — the
             # computed-token bookkeeping drifts until the next step's
-            # schedule collapses under the runner's num_logits assert
-            # (the 2026-11-05 wedge). The window block swap itself stays
-            # after allocate_slots, so this step's boundary advance
-            # cannot refill the just-nulled window.
+            # schedule collapses under the runner's num_logits assert.
+            # The window block swap itself stays after allocate_slots,
+            # so this step's boundary advance cannot refill the
+            # just-nulled window.
             if (
                 self._slot_release
                 and step_tier == 0
@@ -1318,12 +1315,12 @@ class Scheduler(SchedulerInterface):
                     and spec_tier_lookup is not None
                     and not spec_tier_fits
                 ):
-                    # No tier fits the formed batch's end-state footprint
-                    # (tier-loyal fallback): a waiting row may still admit
-                    # only while the GROWN batch fits some tier. The per-row
-                    # trickle past the verdict oversubscribed the shared
-                    # pool (the c16@56K engine kill: chunk-sized footprints
-                    # kept fitting the current free, the pool ran to zero).
+                    # No tier fits the formed batch's end-state footprint:
+                    # a waiting row may still admit only while the GROWN
+                    # batch fits some tier. The per-row trickle past the
+                    # verdict oversubscribes the shared pool (chunk-sized
+                    # footprints keep fitting the current free while the
+                    # pool runs to zero).
                     grown = self.running + [request]
                     tier = spec_tier_lookup[min(len(grown), len(spec_tier_lookup) - 1)]
                     fits = self.kv_cache_manager.spec_batch_fits_tier(grown, tier)
@@ -1716,8 +1713,8 @@ class Scheduler(SchedulerInterface):
                         # MINUS the running rows' remaining growth (their
                         # chunk-allocation demand comes first): a row
                         # admitted past the all-pool verdict grows into
-                        # blocks the check refused to promise — the
-                        # long-generation engine kill. The row stalls
+                        # blocks the check refused to promise — a
+                        # long-generation pool exhaustion. The row stalls
                         # until completions free the pool.
                         break
                     if priceable and prior_tier == 0:
