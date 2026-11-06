@@ -355,13 +355,20 @@ class Scheduler(SchedulerInterface):
         )
         # Release the running rows' idle speculative windows at the K=0
         # crossing (the born-null row shape) so the admission check
-        # prices the freed blocks automatically.
-        self._slot_release = envs.VLLM_MAMBA_K0_SLOT_RELEASE
+        # prices the freed blocks automatically. The K=0 crossing is a
+        # spec-tier-table concept: without the table, step_tier never
+        # leaves its inert 0 and a release would fire on every decode
+        # row while drafts keep flowing at the static K (the 2026-11-05
+        # num_logits assert).
+        self._slot_release = (
+            envs.VLLM_MAMBA_K0_SLOT_RELEASE and self.dynamic_sd_lookup is not None
+        )
         if envs.VLLM_MAMBA_K0_SLOT_RELEASE and not self._slot_release:
             logger.warning(
-                "VLLM_MAMBA_K0_SLOT_RELEASE has no effect without "
-                "VLLM_MAMBA_PRICED_ADMISSION (and a mamba spec-tier "
-                "table); ignoring it."
+                "VLLM_MAMBA_K0_SLOT_RELEASE has no effect without a "
+                "mamba spec-tier table "
+                "(speculative_config.num_speculative_tokens_per_batch_size); "
+                "ignoring it."
             )
 
         # Create the KV cache manager.
@@ -956,13 +963,30 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            # A row pinned at the K=0 tier runs no drafts: its speculative
-            # window is null row slots, and the pin — not the count-based
-            # table — governs its tier until the priced promotion lifts it.
+            # A released row runs no drafts: its speculative window is
+            # null row slots, and the pin — not the count-based table —
+            # governs its tier. In the priced arm a promotion can lift
+            # the pin; in the slot-release arm the release is one-way.
+            if request.spec_token_ids and self.kv_cache_manager.is_spec_released(
+                request.request_id
+            ):
+                request.spec_token_ids = []
+
+            # At a K=0 crossing the step schedules no drafts either:
+            # clear the staged placeholder drafts BEFORE num_new_tokens
+            # is computed. They count toward num_tokens_with_spec, and
+            # clearing them only after the token count would schedule
+            # phantom draft rows that never produce output — the
+            # computed-token bookkeeping drifts until the next step's
+            # schedule collapses under the runner's num_logits assert
+            # (the 2026-11-05 wedge). The window block swap itself stays
+            # after allocate_slots, so this step's boundary advance
+            # cannot refill the just-nulled window.
             if (
-                self._priced_admission
+                self._slot_release
+                and step_tier == 0
                 and request.spec_token_ids
-                and self.kv_cache_manager.is_spec_released(request.request_id)
+                and not request.is_prefill_chunk
             ):
                 request.spec_token_ids = []
 
@@ -1141,7 +1165,10 @@ class Scheduler(SchedulerInterface):
             # swap it for null slots (the born-null row shape) and return
             # the blocks to the pool, where the admission check prices
             # them automatically. Only decode-phase rows release: the
-            # window is idle draft state until the row decodes.
+            # window is idle draft state until the row decodes. This runs
+            # after allocate_slots so the step's boundary advance cannot
+            # refill the just-nulled window positions; the staged draft
+            # clear for this step already happened before num_new_tokens.
             if (
                 self._slot_release
                 and step_tier == 0
@@ -1973,7 +2000,7 @@ class Scheduler(SchedulerInterface):
         # the schedule; otherwise the count-based table answers.
         num_spec_tokens_to_schedule = self.num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            if self._priced_admission:
+            if self._priced_admission or self._slot_release:
                 num_spec_tokens_to_schedule = step_tier
             else:
                 num_spec_tokens_to_schedule = self.dynamic_sd_lookup[

@@ -1470,7 +1470,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # combine_sampled_and_draft_tokens places a request's logits rows
             # at [query_end - num_logits, query_end). Fewer query rows than
             # that would silently select the preceding request's hidden states.
-            assert (num_scheduled_tokens_np >= num_logits).all()
+            if not (num_scheduled_tokens_np >= num_logits).all():
+                logger.warning(
+                    "num_logits assert: sched=%s draft=%s bonus=%s req_ids=%s",
+                    num_scheduled_tokens_np.tolist(),
+                    num_draft_tokens_per_req.tolist(),
+                    num_bonus_tokens,
+                    req_ids,
+                )
+                assert (num_scheduled_tokens_np >= num_logits).all()
             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
