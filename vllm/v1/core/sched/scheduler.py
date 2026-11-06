@@ -369,6 +369,10 @@ class Scheduler(SchedulerInterface):
                 "(speculative_config.num_speculative_tokens_per_batch_size); "
                 "ignoring it."
             )
+        # Demand gate for the K=0 slot release: set when a waiting
+        # admission fails to allocate, cleared when the waiting loop runs
+        # clean. The release fires on pool pressure, not on the tier alone.
+        self._admission_block_stall = False
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -846,6 +850,7 @@ class Scheduler(SchedulerInterface):
         step_tier = 0
         spec_tier_fits = False
         formed_batch: list[Request] = []
+        promoted: list[str] = []
         if (self._priced_admission or self._slot_release) and (
             spec_tier_lookup is not None
         ):
@@ -892,13 +897,33 @@ class Scheduler(SchedulerInterface):
                     # release — step-tier-gated; the 2026-11-05 wedge).
                     step_tier = 0
             else:
-                # One-way release: a released row's window is gone until the
-                # row completes, so the batch stays at K=0 while any released
-                # row runs. No promotion — the pin-then-lift rebuild contract
-                # is unsound (the 2026-11-05 wedge and the num_logits assert).
-                # The cost is spec decode below the K=0 crossing for the
-                # rows sharing the batch with a released row; the reserve
-                # flag and the KV valve carry admission safety.
+                # Promotion revival: promote BEFORE the step tier is
+                # finalized. The old code promoted inside the running loop
+                # after the pin had demoted the tier, so the promotion gate
+                # (step_tier > 0) could never fire while a released row ran
+                # — that ordering WAS the 2026-11-05 wedge. The pin is pool
+                # pressure, not a life sentence: when the table's tier rises
+                # and the formed batch's end-state fits it (the verdict
+                # prices every released row's window plus the watermark),
+                # refill and unpin the released rows; demote to K=0 only if
+                # pinned rows remain — deadlock is structurally impossible.
+                if table_tier > 0:
+                    released_running = [
+                        r
+                        for r in self.running
+                        if self.kv_cache_manager.is_spec_released(r.request_id)
+                    ]
+                    if released_running and (
+                        self.kv_cache_manager.spec_batch_fits_tier(
+                            formed_batch, table_tier
+                        )
+                    ):
+                        for r in released_running:
+                            if self.kv_cache_manager.promote_spec_blocks(
+                                r.request_id,
+                                reserve=self.kv_cache_manager.watermark_blocks,
+                            ):
+                                promoted.append(r.request_id)
                 if any(
                     self.kv_cache_manager.is_spec_released(r.request_id)
                     for r in self.running
@@ -1168,9 +1193,13 @@ class Scheduler(SchedulerInterface):
             # after allocate_slots so the step's boundary advance cannot
             # refill the just-nulled window positions; the staged draft
             # clear for this step already happened before num_new_tokens.
+            # Demand-gated: the release fires only when admissions
+            # stalled on blocks (the previous step's verdict) — pool
+            # pressure, not the tier alone.
             if (
                 self._slot_release
                 and step_tier == 0
+                and self._admission_block_stall
                 and not (request.is_prefill_chunk)
                 and self.kv_cache_manager.release_spec_blocks(request_id)
             ):
@@ -1228,6 +1257,16 @@ class Scheduler(SchedulerInterface):
                     duplicate_encoder_inputs,
                 )
 
+        # A row promoted this step that the loop then skipped (token
+        # budget, PP cadence) re-pins: the runner row was rebuilt to the
+        # nulled table at its release, so the refill must reach it through
+        # a scheduled step's rebuild entry, not a skipped one.
+        if promoted:
+            scheduled_ids = {r.request_id for r in scheduled_running_reqs}
+            for req_id in promoted:
+                if req_id not in scheduled_ids:
+                    self.kv_cache_manager.release_spec_blocks(req_id)
+
         # Record the LoRAs of all running requests, including those not
         # scheduled in this step, which can join a later batch.
         scheduled_loras: set[int] = set()
@@ -1241,6 +1280,7 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
+            self._admission_block_stall = False
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
 
@@ -1678,6 +1718,12 @@ class Scheduler(SchedulerInterface):
                         break
                     if priceable and prior_tier == 0:
                         self.kv_cache_manager.mark_spec_admission_tier0(request_id)
+                elif self._slot_release and step_tier == 0:
+                    # Born-null admission in the slot-release arm: a row
+                    # admitted at a K=0 step is pinned at birth — its
+                    # window is born as null row slots and never
+                    # allocates-then-releases.
+                    self.kv_cache_manager.mark_spec_admission_tier0(request_id)
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -1734,7 +1780,14 @@ class Scheduler(SchedulerInterface):
                             self.kv_cache_manager.unmark_spec_admission(request_id)
 
                 if new_blocks is None:
-                    # The request cannot be scheduled.
+                    # The request cannot be scheduled: pool pressure (the
+                    # demand gate for the K=0 slot release).
+                    self._admission_block_stall = True
+                    if self._slot_release:
+                        # A born-null mark on a row that did not admit is
+                        # stale: at a later K>0 admission it would pin a
+                        # row the tier scheduled with drafts.
+                        self.kv_cache_manager.unmark_spec_admission(request_id)
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1944,11 +1997,7 @@ class Scheduler(SchedulerInterface):
             ]
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
-            row_rebuild_reqs = (
-                self.kv_cache_manager.take_spec_row_rebuilds()
-                if self._priced_admission
-                else set()
-            )
+            row_rebuild_reqs = self.kv_cache_manager.take_spec_row_rebuilds()
             cached_reqs_data = self._make_cached_request_data(
                 scheduled_running_reqs,
                 scheduled_resumed_reqs,
