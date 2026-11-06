@@ -1973,7 +1973,14 @@ class Scheduler(SchedulerInterface):
             ]
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
-            row_rebuild_reqs = self.kv_cache_manager.take_spec_row_rebuilds()
+            # The spec-row rebuild set is populated only under the priced
+            # admission or slot-release arms (release/resume/promote); skip
+            # the manager walk on the default path.
+            row_rebuild_reqs = (
+                self.kv_cache_manager.take_spec_row_rebuilds()
+                if (self._priced_admission or self._slot_release)
+                else set()
+            )
             cached_reqs_data = self._make_cached_request_data(
                 scheduled_running_reqs,
                 scheduled_resumed_reqs,
